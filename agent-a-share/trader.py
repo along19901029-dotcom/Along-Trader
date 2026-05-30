@@ -1,6 +1,6 @@
 """
 A股 AI-Trader Agent — A 股模拟交易脚本
-基于新浪行情 API + 本地模拟撮合，支持 T+1、涨跌停、分时段交易。
+基于 Tushare Pro 行情数据 + 本地模拟撮合，支持 T+1、涨跌停、分时段交易。
 """
 import hashlib
 import json
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+import tushare as ts
 from dotenv import load_dotenv
 
 # ── Config ──────────────────────────────────────────────
@@ -28,12 +29,18 @@ INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL", "60"))
 
+# Tushare
+TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
+ts.set_token(TUSHARE_TOKEN)
+pro = ts.pro_api()
+_STOCK_NAMES: dict = {}
+
 # Email
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.qq.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
-REPORT_EMAIL = os.getenv("REPORT_EMAIL", "your_email@qq.com")
+REPORT_EMAIL = os.getenv("REPORT_EMAIL", "504975497@qq.com")
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -90,7 +97,13 @@ def is_trading_day() -> bool:
     t = datetime.now()
     if t.weekday() >= 5:
         return False
-    return True
+    try:
+        today_str = t.strftime("%Y%m%d")
+        cal = pro.trade_cal(exchange="SSE", start_date=today_str,
+                           end_date=today_str, is_open="1")
+        return len(cal) > 0
+    except Exception:
+        return True  # fallback: assume trading day
 
 
 def trading_session() -> str:
@@ -116,12 +129,62 @@ def minutes_after_close() -> int:
     return int(delta // 60) if delta >= 0 else -1
 
 
-# ── Market Data (Sina API) ──────────────────────────────
+# ── Market Data (Tushare Pro) ───────────────────────────
 
 _price_cache: dict = {}
 _PREV_CLOSE_CACHE: dict = {}
 _universe_cache: list = []
 _universe_date: str = ""
+_last_trade_date: str = ""
+
+
+def _sina_to_ts(code: str) -> str:
+    """sh600519 → 600519.SH, sz000001 → 000001.SZ"""
+    if code.startswith("sh"):
+        return f"{code[2:]}.SH"
+    elif code.startswith("sz"):
+        return f"{code[2:]}.SZ"
+    return code
+
+
+def _ts_to_sina(code: str) -> str:
+    """600519.SH → sh600519, 000001.SZ → sz000001"""
+    if code.endswith(".SH"):
+        return "sh" + code[:6]
+    elif code.endswith(".SZ"):
+        return "sz" + code[:6]
+    return code
+
+
+def _get_latest_trade_date() -> str:
+    """获取最近一个交易日。"""
+    global _last_trade_date
+    if _last_trade_date:
+        return _last_trade_date
+    try:
+        cal = pro.trade_cal(exchange="SSE", start_date="20260101",
+                           end_date=datetime.now().strftime("%Y%m%d"), is_open="1")
+        if len(cal) > 0:
+            _last_trade_date = str(cal.iloc[-1]["cal_date"])
+            return _last_trade_date
+    except Exception:
+        pass
+    return datetime.now().strftime("%Y%m%d")
+
+
+def _load_stock_names(ts_codes: list):
+    """懒加载股票名称。"""
+    global _STOCK_NAMES
+    missing = [c for c in ts_codes if c not in _STOCK_NAMES]
+    if not missing:
+        return
+    try:
+        codes_str = ",".join(missing[:100])
+        df = pro.stock_basic(ts_code=codes_str, fields="ts_code,name")
+        for _, row in df.iterrows():
+            _STOCK_NAMES[row["ts_code"]] = row["name"]
+    except Exception:
+        pass
 
 
 def get_universe() -> list:
@@ -131,18 +194,16 @@ def get_universe() -> list:
     if _universe_cache and _universe_date == today:
         return _universe_cache
     try:
-        import akshare as ak
-        df = ak.index_stock_cons(symbol=UNIVERSE_INDEX)
+        trade_date = _get_latest_trade_date()
+        df = pro.index_weight(index_code=f"{UNIVERSE_INDEX}.SH",
+                              trade_date=trade_date)
         codes = []
         for _, row in df.iterrows():
-            raw = str(row.iloc[0])
-            # akshare returns raw codes like 000300 or 600519
-            code = raw.zfill(6)
-            prefix = "sz" if code.startswith(("0", "3")) else "sh"
-            codes.append(prefix + code)
+            ts_code = row["con_code"]  # e.g. "600519.SH"
+            codes.append(_ts_to_sina(ts_code))
         _universe_cache = codes
         _universe_date = today
-        log.info("候选池已刷新: %s 指数, %s 只标的", UNIVERSE_INDEX, len(codes))
+        log.info("候选池已刷新: %s, %d 只标的", UNIVERSE_INDEX, len(codes))
         return codes
     except Exception as e:
         log.warning("获取指数成分股失败: %s，使用缓存", e)
@@ -184,47 +245,40 @@ def screen_buy_candidates(state: dict) -> list:
 
 
 def refresh_prices(symbols: list):
-    """从新浪行情 API 批量获取实时价格和涨跌停价。"""
+    """从 Tushare 批量获取最新日线行情（最多 50 只/次）。"""
     global _price_cache, _PREV_CLOSE_CACHE
     if not symbols:
         return
-    sina_codes = ",".join(symbols)
+
+    ts_codes = [_sina_to_ts(s) for s in symbols]
+    _load_stock_names(ts_codes)
+
     try:
-        r = requests.get(
-            f"https://hq.sinajs.cn/list={sina_codes}",
-            headers={"Referer": "https://finance.sina.com.cn"},
-            timeout=10,
-        )
-        r.encoding = "gbk"
-        for line in r.text.strip().split("\n"):
-            m = re.search(r'hq_str_(\w+)="(.+)"', line)
-            if not m:
-                continue
-            code = m.group(1)
-            fields = m.group(2).split(",")
-            if len(fields) < 32:
-                continue
-            try:
-                name = fields[0]
-                prev_close = float(fields[2])
-                current = float(fields[3])
-                high_limit = float(fields[9]) if fields[9] else prev_close * 1.1
-                low_limit = float(fields[10]) if fields[10] else prev_close * 0.9
-                _price_cache[code] = {
-                    "code": code,
-                    "name": name,
-                    "price": current,
-                    "prev_close": prev_close,
-                    "open": float(fields[1]),
-                    "high": float(fields[4]),
-                    "low": float(fields[5]),
-                    "high_limit": high_limit,
-                    "low_limit": low_limit,
-                    "volume": float(fields[8]),
-                }
-                _PREV_CLOSE_CACHE[code] = prev_close
-            except (ValueError, IndexError):
-                continue
+        codes_str = ",".join(ts_codes[:50])
+        df = pro.daily(ts_code=codes_str,
+                       fields="ts_code,trade_date,open,high,low,close,pre_close,vol")
+
+        for _, row in df.iterrows():
+            ts_code = row["ts_code"]
+            code = _ts_to_sina(ts_code)
+            close = float(row["close"])
+            pre_close = float(row["pre_close"])
+            is_cyb_or_kcb = ts_code.startswith("300") or ts_code.startswith("688")
+            limit_pct = 0.2 if is_cyb_or_kcb else 0.1
+            _price_cache[code] = {
+                "code": code,
+                "name": _STOCK_NAMES.get(ts_code, code),
+                "price": close,
+                "prev_close": pre_close,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "high_limit": round(pre_close * (1 + limit_pct), 2),
+                "low_limit": round(pre_close * (1 - limit_pct), 2),
+                "volume": float(row["vol"]),
+            }
+            _PREV_CLOSE_CACHE[code] = pre_close
+
     except Exception as e:
         log.warning("行情获取失败: %s", e)
 
@@ -508,6 +562,23 @@ def run_loop():
                     save_state(state)
                 except Exception as e:
                     log.warning("日报发送失败: %s", e)
+
+            # 日报已发送 + 非交易时段 → 退出
+            if state.get("report_sent_date") == today_str and not is_trading_time():
+                log.info("日报已发送，今日任务完成，退出进程")
+                save_state(state)
+                break
+
+            # 非交易日空闲检测：连续 3 个周期无操作 → 退出
+            if not is_trading_day() and not is_trading_time():
+                idle = state.get("_idle_cycles", 0) + 1
+                state["_idle_cycles"] = idle
+                if idle >= 3:
+                    log.info("非交易日，退出进程")
+                    save_state(state)
+                    break
+            else:
+                state["_idle_cycles"] = 0
 
             save_state(state)
 

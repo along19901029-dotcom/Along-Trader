@@ -135,6 +135,18 @@ change.md
 
 # Agent runtime files
 state.json
+state.json.bak.*
 .token
 *.log
 logs/
+
+# VPS test artifacts
+agent-us/*_ai-trader-*.txt
+agent-us/vps_*.txt
+agent-us/env_vps
+
+# Temp fix scripts (session artifacts)
+tmp_*.py
+
+# Local test output
+*_out.txt

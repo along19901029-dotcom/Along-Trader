@@ -1,15 +1,13 @@
 """
 债券 AI-Trader Agent — 中国可转债模拟交易脚本
+数据源：Tushare Pro（cb_basic + cb_daily），本地模拟撮合。
 双策略并行：
   - 60% 中长期持有：优选高评级、正收益率的可转债，买入后长期持有
   - 40% 灵活交易：高流动性可转债波段操作，T+0 随时买卖
-数据源：AKShare（集思录）+ 新浪行情 API，本地模拟撮合。
 """
-import hashlib
 import json
 import logging
 import os
-import re
 import signal
 import smtplib
 import sys
@@ -20,7 +18,7 @@ from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from typing import Optional
 
-import requests
+import tushare as ts
 from dotenv import load_dotenv
 
 # ── Config ──────────────────────────────────────────────
@@ -30,6 +28,11 @@ AGENT_NAME = os.getenv("AGENT_NAME", "BondAgent")
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "200000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL", "60"))
+
+TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
+ts.set_token(TUSHARE_TOKEN)
+pro = ts.pro_api()
+_BOND_NAMES: dict = {}
 
 # 资金分配
 LONG_TERM_RATIO = float(os.getenv("LONG_TERM_RATIO", "0.60"))
@@ -60,7 +63,7 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.qq.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
-REPORT_EMAIL = os.getenv("REPORT_EMAIL", "your_email@qq.com")
+REPORT_EMAIL = os.getenv("REPORT_EMAIL", "504975497@qq.com")
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -106,8 +109,13 @@ def save_state(state: dict):
 # ── Market Clock ────────────────────────────────────────
 
 def is_trading_day() -> bool:
-    t = datetime.now()
-    return t.weekday() < 5
+    today_str = datetime.now().strftime("%Y%m%d")
+    try:
+        cal = pro.trade_cal(exchange="SSE", start_date=today_str,
+                            end_date=today_str, is_open="1")
+        return len(cal) > 0
+    except Exception:
+        return datetime.now().weekday() < 5
 
 
 def trading_session() -> str:
@@ -197,27 +205,33 @@ def buy_reverse_repo(state: dict, amount: float) -> bool:
 
 # ── Market Data ─────────────────────────────────────────
 
-_price_cache: dict = {}     # sina_code → {price, prev_close, open, volume, ...}
-_bond_analytics: dict = {}  # sina_code → {ytm, pure_bond_value, conv_premium, rating, remain_years}
+_price_cache: dict = {}     # raw_code → {price, prev_close, open, volume, ...}
+_bond_analytics: dict = {}  # raw_code → {ytm, pure_bond_value, conv_premium, rating, remain_years, ...}
 _universe_cache: list = []
 _universe_date: str = ""
+_last_trade_date: str = ""
 
 
-def _code_to_sina(code: str) -> str:
+def _bond_code_to_ts(code: str) -> str:
     code = str(code).strip()
-    # 可转债：11xxxx → sh (上海), 12xxxx → sz (深圳)
+    if code.startswith("sh"):
+        return f"{code[2:]}.SH"
+    if code.startswith("sz"):
+        return f"{code[2:]}.SZ"
     if code.startswith("11"):
-        return "sh" + code
+        return f"{code}.SH"
     if code.startswith("12"):
-        return "sz" + code
-    # 通用规则：0/2/3 → sz, 5/6/8/9 → sh
+        return f"{code}.SZ"
     if code.startswith(("0", "2", "3")):
-        return "sz" + code
-    return "sh" + code
+        return f"{code}.SZ"
+    return f"{code}.SH"
+
+
+def _ts_to_bond_code(ts_code: str) -> str:
+    return ts_code.split(".")[0]
 
 
 def _rating_score(rating: str) -> int:
-    """债券评级转分值，用于排序筛选。"""
     if not rating:
         return 0
     r = rating.strip().upper()
@@ -227,8 +241,19 @@ def _rating_score(rating: str) -> int:
     return 0
 
 
+def _get_latest_trade_date() -> str:
+    global _last_trade_date
+    if _last_trade_date:
+        return _last_trade_date
+    cal = pro.trade_cal(exchange="SSE", start_date="20260101",
+                        end_date=datetime.now().strftime("%Y%m%d"), is_open="1")
+    if len(cal) > 0:
+        _last_trade_date = str(cal.iloc[-1]["cal_date"])
+        return _last_trade_date
+    return datetime.now().strftime("%Y%m%d")
+
+
 def get_universe() -> list:
-    """获取可转债候选池（AKShare 集思录 + Eastmoney 双重 fallback）。"""
     global _universe_cache, _bond_analytics, _universe_date
     today = datetime.now().strftime("%Y-%m-%d")
     if _universe_cache and _universe_date == today:
@@ -236,95 +261,55 @@ def get_universe() -> list:
 
     bonds = []
 
-    def _from_jisilu_rows(rows):
-        for row in rows:
-            try:
-                code = str(row.get("转债代码", "")).strip()
-                name = str(row.get("转债名称", "")).strip()
-                price = float(row.get("转债现价", 0))
-                ytm_str = str(row.get("到期税前收益率", "0%")).replace("%", "")
-                ytm = float(ytm_str) / 100 if ytm_str else 0
-                premium_str = str(row.get("转股溢价率", "0%")).replace("%", "")
-                conv_premium = float(premium_str) / 100 if premium_str else 0
-                pure_val = float(row.get("纯债价值", 0))
-                rating = str(row.get("债券评级", "")).strip()
-                remain_str = str(row.get("剩余年限", "0")).replace("年", "")
-                remain_years = float(remain_str) if remain_str else 0
-                turnover = float(row.get("成交额", 0))
-                if not code or price <= 0:
-                    continue
-                if turnover < MIN_DAILY_TURNOVER:
-                    continue
-                sina_code = _code_to_sina(code)
-                _bond_analytics[sina_code] = {
-                    "name": name,
-                    "ytm": ytm,
-                    "pure_bond_value": pure_val,
-                    "conv_premium": conv_premium,
-                    "rating": rating,
-                    "remain_years": remain_years,
-                    "turnover": turnover,
-                }
-                bonds.append(sina_code)
-            except (ValueError, KeyError):
-                continue
-
-    # 1) AKShare 集思录
     try:
-        import akshare as ak
-        df = ak.bond_cb_jsl(cookie="")
-        rows = []
+        today_str = datetime.now().strftime("%Y%m%d")
+        df = pro.cb_basic(
+            fields="ts_code,bond_short_name,stk_code,list_date,conv_price,rate,maturity_date,newest_rating,cb_type"
+        )
         for _, row in df.iterrows():
-            d = {}
-            for col in df.columns:
-                d[col] = row[col]
-            rows.append(d)
-        _from_jisilu_rows(rows)
+            ts_code = row["ts_code"]
+            code = _ts_to_bond_code(ts_code)
+            name = str(row.get("bond_short_name", "") or "")
+            # 仅保留未到期的可转债（排除可交换债 EB）
+            cb_type = str(row.get("cb_type", "") or "")
+            if cb_type == "EB":
+                continue
+            maturity_str = str(row.get("maturity_date", "") or "")
+            if not maturity_str or maturity_str in ("nan", "None", ""):
+                continue
+            if maturity_str < today_str:
+                continue  # 已到期，跳过
+
+            conv_price = float(row.get("conv_price", 0) or 0)
+            rate_raw = float(row.get("rate", 0) or 0)
+            rate = rate_raw / 100.0 if rate_raw > 1 else rate_raw
+            maturity = datetime.strptime(maturity_str[:8], "%Y%m%d")
+            remain_years = max(0.0, (maturity - datetime.now()).days / 365.25)
+            rating = str(row.get("newest_rating", "") or "")
+
+            _bond_analytics[code] = {
+                "name": name,
+                "ytm": 0.0,
+                "pure_bond_value": 0.0,
+                "conv_premium": 0.0,
+                "rating": rating,
+                "remain_years": remain_years,
+                "turnover": 0.0,
+                "conv_price": conv_price,
+                "rate": rate,
+            }
+            _BOND_NAMES[code] = name
+            bonds.append(code)
     except Exception as e:
-        log.warning("AKShare 可转债列表获取失败: %s", e)
+        log.warning("Tushare 可转债列表获取失败: %s", e)
 
-    # 2) Eastmoney API 直连
-    if not bonds:
-        try:
-            rows = []
-            for page in range(1, 10):
-                r = requests.get(
-                    "https://push2.eastmoney.com/api/qt/clist/get",
-                    params={
-                        "pn": str(page), "pz": "100", "po": "1", "np": "1",
-                        "fltt": "2", "invt": "2", "fid": "f3",
-                        "fs": "b:MK0354",
-                        "fields": "f2,f6,f12,f14,f15,f16,f17,f18",
-                    },
-                    timeout=15,
-                )
-                data = r.json()
-                diff = data.get("data", {}).get("diff", [])
-                if not diff:
-                    break
-                for d in diff:
-                    code = str(d.get("f12", "")).strip()
-                    name = d.get("f14", "")
-                    price = float(d.get("f2", 0))
-                    turnover = float(d.get("f6", 0))
-                    if not code or price <= 0 or turnover < MIN_DAILY_TURNOVER:
-                        continue
-                    sina_code = _code_to_sina(code)
-                    _bond_analytics[sina_code] = {
-                        "name": name, "ytm": 0, "pure_bond_value": 0,
-                        "conv_premium": 0, "rating": "", "remain_years": 0,
-                        "turnover": turnover,
-                    }
-                    bonds.append(sina_code)
-            rows = None  # free memory
-        except Exception as e:
-            log.warning("Eastmoney 可转债列表获取失败: %s", e)
-
-    # 3) 内置回退
-    if not bonds and not _universe_cache:
+    if bonds:
+        _universe_cache = bonds
+        _universe_date = today
+        log.info("可转债候选池已刷新: %s 只标的", len(bonds))
+    elif not _universe_cache:
         log.info("使用内置可转债精选列表")
         fallback = [
-            # ── 上海 113 系列（可转债主力）──
             "113013", "113016", "113021", "113024", "113030", "113033",
             "113037", "113039", "113042", "113043", "113044", "113045",
             "113046", "113048", "113049", "113050", "113051", "113052",
@@ -333,7 +318,6 @@ def get_universe() -> list:
             "113516", "113519", "113521", "113524", "113525", "113527",
             "113530", "113532", "113534", "113537", "113541", "113545",
             "113549", "113550", "113551", "113552", "113553", "113554",
-            # ── 上海 118 系列（较新可转债）──
             "118001", "118003", "118004", "118005", "118006", "118007",
             "118008", "118009", "118010", "118011", "118012", "118013",
             "118014", "118015", "118016", "118017", "118018", "118019",
@@ -342,7 +326,6 @@ def get_universe() -> list:
             "118032", "118033", "118034", "118035", "118036", "118037",
             "118038", "118039", "118040", "118041", "118042", "118043",
             "118044", "118045",
-            # ── 深圳 123/127/128 系列 ──
             "123107", "123108", "123109", "123110", "123111", "123112",
             "123113", "123114", "123115", "123116", "123117", "123118",
             "127001", "127002", "127003", "127004", "127005", "127006",
@@ -363,15 +346,9 @@ def get_universe() -> list:
             "128090", "128093", "128095", "128097", "128101", "128106",
             "128109", "128111", "128116", "128119", "128123",
         ]
-        fallback_sina = [_code_to_sina(c) for c in fallback]
-        _universe_cache = fallback_sina
+        _universe_cache = fallback
         _universe_date = today
-        return fallback_sina
-
-    if bonds:
-        _universe_cache = bonds
-        _universe_date = today
-        log.info("可转债候选池已刷新: %s 只标的", len(bonds))
+        return fallback
     else:
         log.info("使用缓存的 %s 只可转债", len(_universe_cache))
 
@@ -379,52 +356,52 @@ def get_universe() -> list:
 
 
 def refresh_prices(symbols: list):
-    """从新浪行情 API 批量获取可转债实时价格。"""
     global _price_cache
     if not symbols:
         return
-    sina_codes = ",".join(symbols)
-    try:
-        r = requests.get(
-            f"https://hq.sinajs.cn/list={sina_codes}",
-            headers={"Referer": "https://finance.sina.com.cn"},
-            timeout=10,
-        )
-        r.encoding = "gbk"
-        for line in r.text.strip().split("\n"):
-            m = re.search(r'hq_str_(\w+)="(.+)"', line)
-            if not m:
+    ts_codes = [_bond_code_to_ts(s) for s in symbols]
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=5)).strftime("%Y%m%d")
+    for ts_code in ts_codes:
+        code = _ts_to_bond_code(ts_code)
+        try:
+            df = pro.cb_daily(ts_code=ts_code, start_date=start_date, end_date=end_date,
+                              fields="ts_code,trade_date,open,high,low,close,pre_close,vol,amount")
+            if len(df) == 0:
                 continue
-            code = m.group(1)
-            fields = m.group(2).split(",")
-            if len(fields) < 9:
-                continue
-            try:
-                name = fields[0]
-                price = float(fields[3]) if fields[3] else 0
-                prev_close = float(fields[2]) if fields[2] else 0
-                if price <= 0:
-                    continue
-                _price_cache[code] = {
-                    "code": code,
-                    "name": name,
-                    "price": price,
-                    "prev_close": prev_close,
-                    "open": float(fields[1]) if fields[1] else price,
-                    "high": float(fields[4]) if fields[4] else price,
-                    "low": float(fields[5]) if fields[5] else price,
-                    "volume": float(fields[8]) if len(fields) > 8 and fields[8] else 0,
+            row = df.iloc[-1]  # 取最新一行
+            close = float(row["close"])
+            pre_close = float(row["pre_close"])
+            vol = float(row["vol"])
+            amount = float(row.get("amount", 0) or 0)
+
+            _price_cache[code] = {
+                "code": code,
+                "name": _BOND_NAMES.get(code, code),
+                "price": close,
+                "prev_close": pre_close,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "volume": vol,
+            }
+
+            ana = _bond_analytics.get(code, {})
+            ana["turnover"] = amount
+            rate = ana.get("rate", 0)
+            remain = ana.get("remain_years", 0)
+            if rate > 0 and remain > 0 and close > 0:
+                annual_coupon = 100 * rate
+                ytm = (annual_coupon + (100 - close) / remain) / ((100 + close) / 2)
+                ana["ytm"] = ytm
+            if code not in _bond_analytics:
+                _bond_analytics[code] = {
+                    "name": _BOND_NAMES.get(code, code),
+                    "ytm": 0.0, "pure_bond_value": 0.0, "conv_premium": 0.0,
+                    "rating": "", "remain_years": 0.0, "turnover": amount,
                 }
-                if code not in _bond_analytics:
-                    _bond_analytics[code] = {
-                        "name": name, "ytm": 0, "pure_bond_value": 0,
-                        "conv_premium": 0, "rating": "", "remain_years": 0,
-                        "turnover": 0,
-                    }
-            except (ValueError, IndexError):
-                continue
-    except Exception as e:
-        log.warning("行情获取失败: %s", e)
+        except Exception as e:
+            log.debug("行情获取失败 %s: %s", ts_code, e)
 
 
 def fetch_price(code: str) -> Optional[float]:
@@ -799,10 +776,10 @@ def run_loop():
         try:
             ensure_daily_state(state)
 
-            # 获取行情（含 R-001 逆回购利率）
+            # 获取行情（cb_daily 仅支持单券查询，限制批量大小）
             universe = get_universe()
             holdings = list(state.get("positions", {}).keys())
-            all_symbols = list(set(holdings + universe[:60] + ["sz131810"]))
+            all_symbols = list(set(holdings + universe[:30]))
             refresh_prices(all_symbols)
 
             if is_market_open():
@@ -835,9 +812,9 @@ def run_loop():
                     if p.get("strategy") == "long_term"
                 )
                 if lt_count < MAX_LONG_TERM_POSITIONS:
-                    # 扩展行情覆盖
-                    if len(universe) > 60:
-                        refresh_prices(universe[60:150])
+                    # 扩展行情覆盖（每批 30 只，控制 API 调用频率）
+                    if len(universe) > 30:
+                        refresh_prices(universe[30:80])
                     lt_candidates = screen_long_term_candidates(state)
                     for code, score, price in lt_candidates:
                         lt_count = sum(
@@ -918,6 +895,23 @@ def run_loop():
                     save_state(state)
                 except Exception as e:
                     log.warning("日报发送失败: %s", e)
+
+            # 日报已发送 + 非交易时段 → 退出
+            if state.get("report_sent_date") == today_str and not is_market_open():
+                log.info("日报已发送，今日任务完成，退出进程")
+                save_state(state)
+                break
+
+            # 非交易日空闲检测：连续 3 个周期无操作 → 退出
+            if not is_trading_day() and not is_market_open():
+                idle = state.get("_idle_cycles", 0) + 1
+                state["_idle_cycles"] = idle
+                if idle >= 3:
+                    log.info("非交易日，退出进程")
+                    save_state(state)
+                    break
+            else:
+                state["_idle_cycles"] = 0
 
             save_state(state)
 
@@ -1099,7 +1093,7 @@ def send_report_email(html_content: str):
 
 def main():
     log.info("债券 AI-Trader 启动...")
-    log.info("数据源: AKShare(集思录) + 新浪行情 | 交易模拟: 本地撮合 | 品种: 可转债")
+    log.info("数据源: Tushare Pro | 交易模拟: 本地撮合 | 品种: 可转债")
     run_loop()
 
 

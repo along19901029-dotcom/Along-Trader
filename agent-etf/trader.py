@@ -1,6 +1,6 @@
 """
 ETF AI-Trader Agent — A股 ETF 模拟交易脚本
-基于新浪行情 API + 本地模拟撮合，专注 ETF 品种（股票型/指数型），
+基于 Tushare Pro 行情数据 + 本地模拟撮合，专注 ETF 品种（股票型/指数型），
 免印花税，按流动性过滤，动量轮动策略。
 """
 import hashlib
@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+import tushare as ts
 from dotenv import load_dotenv
 
 # ── Config ──────────────────────────────────────────────
@@ -29,12 +30,18 @@ INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "200000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL", "60"))
 
+# Tushare
+TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
+ts.set_token(TUSHARE_TOKEN)
+pro = ts.pro_api()
+_ETF_NAMES: dict = {}
+
 # Email
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.qq.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
-REPORT_EMAIL = os.getenv("REPORT_EMAIL", "your_email@qq.com")
+REPORT_EMAIL = os.getenv("REPORT_EMAIL", "504975497@qq.com")
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -89,7 +96,13 @@ def is_trading_day() -> bool:
     t = datetime.now()
     if t.weekday() >= 5:
         return False
-    return True
+    try:
+        today_str = t.strftime("%Y%m%d")
+        cal = pro.trade_cal(exchange="SSE", start_date=today_str,
+                           end_date=today_str, is_open="1")
+        return len(cal) > 0
+    except Exception:
+        return True
 
 
 def trading_session() -> str:
@@ -122,21 +135,21 @@ _universe_cache: list = []
 _universe_date: str = ""
 
 
-def _code_to_sina(code: str) -> str:
-    """ETF 代码转新浪格式。159xxx → sz, 5xxxxx → sh"""
+def _etf_code_to_ts(code: str) -> str:
+    """510050 → 510050.SH, 159919 → 159919.SZ"""
     code = str(code).strip()
     if code.startswith(("0", "1", "3")):
-        return "sz" + code
-    return "sh" + code
+        return f"{code}.SZ"
+    return f"{code}.SH"
 
 
-def _sina_to_code(sina: str) -> str:
-    """新浪格式转回 6 位代码。"""
-    return sina[2:]
+def _ts_to_etf_code(ts_code: str) -> str:
+    """510050.SH → 510050, 159919.SZ → 159919"""
+    return ts_code.split(".")[0]
 
 
 def get_universe() -> list:
-    """获取 ETF 候选池（AKShare 全市场 ETF 列表，按类型/流动性过滤，每日刷新）。"""
+    """获取 ETF 候选池（Tushare fund_basic，每日刷新）。"""
     global _universe_cache, _universe_meta, _universe_date
     today = datetime.now().strftime("%Y-%m-%d")
     if _universe_cache and _universe_date == today:
@@ -145,124 +158,31 @@ def get_universe() -> list:
     allowed_types = set(t.strip() for t in ETF_TYPE_FILTER.split(","))
     etf_list = []
 
-    def _build_from_rows(rows):
-        """从行数据构建 ETF 列表，每行: (code, name, price, turnover, fund_type)"""
-        for code, name, price, turnover, fund_type in rows:
+    try:
+        df = pro.fund_basic(market="E")
+        for _, row in df.iterrows():
+            ts_code = row["ts_code"]
+            code = _ts_to_etf_code(ts_code)
+            name = row.get("name", "")
+            fund_type = row.get("fund_type", "")
             if fund_type not in allowed_types:
                 continue
-            if turnover < MIN_DAILY_TURNOVER:
-                continue
-            if price <= 0:
-                continue
-            sina_code = _code_to_sina(code)
-            _universe_meta[sina_code] = {
+            etf_list.append(code)
+            _ETF_NAMES[code] = name
+            _universe_meta[code] = {
                 "name": name,
                 "type": fund_type,
-                "turnover": turnover,
+                "turnover": 0,
             }
-            etf_list.append(sina_code)
-
-    # 尝试 AKShare（VPS 上可用）
-    try:
-        import akshare as ak
-        df = ak.fund_etf_spot_em()
-        cols = df.columns.tolist()
-        # AKShare 列名: 代码, 名称, 最新价, 涨跌幅, ..., 成交额, ..., 基金类型
-        rows = []
-        for _, row in df.iterrows():
-            code = str(row.get("代码", "")).strip()
-            name = str(row.get("名称", "")).strip()
-            price = float(row.get("最新价", 0))
-            turnover = float(row.get("成交额", 0))
-            fund_type = str(row.get("基金类型", "")).strip()
-            rows.append((code, name, price, turnover, fund_type))
-        _build_from_rows(rows)
+        log.info("ETF 候选池已刷新 (Tushare): %d 只", len(etf_list))
     except Exception as e:
-        log.warning("AKShare ETF 列表获取失败: %s", e)
-
-    # AKShare 失败则尝试 Eastmoney API 直连
-    if not etf_list:
-        try:
-            rows = []
-            for page in range(1, 15):
-                r = requests.get(
-                    "https://push2.eastmoney.com/api/qt/clist/get",
-                    params={
-                        "pn": str(page), "pz": "100", "po": "1", "np": "1",
-                        "fltt": "2", "invt": "2", "fid": "f3",
-                        "fs": "b:MK0021,b:MK0022,b:MK0023,b:MK0024",
-                        "fields": "f2,f6,f12,f14,f402",
-                    },
-                    timeout=15,
-                )
-                data = r.json()
-                for d in data.get("data", {}).get("diff", []):
-                    if d.get("f12") and d.get("f2"):
-                        code = str(d["f12"]).strip()
-                        name = d.get("f14", "")
-                        price = float(d["f2"])
-                        turnover = float(d.get("f6", 0))
-                        fund_type = str(d.get("f402", "")).strip()
-                        rows.append((code, name, price, turnover, fund_type))
-                if not data.get("data", {}).get("diff"):
-                    break
-            _build_from_rows(rows)
-        except Exception as e:
-            log.warning("Eastmoney ETF 列表获取失败: %s", e)
-
-    # 最终回退：高流动性 ETF 精选列表（~180 只，覆盖全品类）
-    if not etf_list and not _universe_cache:
-        log.info("使用内置 ETF 精选列表")
-        fallback = [
-            # ── 宽基指数 ──
-            "510050", "510300", "510500", "510880", "510210", "510310",
-            "512100", "512200", "512400", "512500", "512510", "512580",
-            "159919", "159915", "159922", "159925", "159949",
-            "588000", "588050", "588080", "588200", "588300", "588400",
-            # ── 行业：证券/金融 ──
-            "512880", "512000", "512070", "512800", "512690", "512990",
-            "159940", "159841", "159851",
-            # ── 行业：科技/TMT ──
-            "512480", "512720", "512760", "512930", "515050", "515880",
-            "159995", "159996", "159998", "159997", "159801", "159807",
-            "159939", "159994",
-            # ── 行业：医药/消费 ──
-            "512010", "512120", "512170", "512290", "512600", "512710",
-            "159938", "159929", "159992", "159883", "159645",
-            # ── 行业：军工/制造 ──
-            "512660", "512670", "512680", "512810",
-            "159611", "159638", "159967",
-            # ── 行业：新能源/周期 ──
-            "516160", "516510", "516970", "516520", "516110", "516020",
-            "159865", "159766", "159781", "159790", "159875", "159609",
-            # ── 行业：基建/地产/交通 ──
-            "516950", "516650", "516970", "516880", "516180",
-            "159787", "159845",
-            # ── 风格/策略 ──
-            "512890", "515080", "515100", "515180", "515450",
-            "159905", "159906", "159910", "159825",
-            # ── 跨境/港股/QDII ──
-            "513100", "513500", "513050", "513180", "513060", "513120",
-            "159601", "159605", "159607", "159612", "159615", "159688",
-            "159696", "159699", "159741", "159792",
-            # ── 商品/黄金 ──
-            "518880", "518600", "518680",
-            "159980", "159981", "159985",
-            # ── 债券/货币（低风险备选）──
-            "511010", "511020", "511030", "511260", "511360",
-            "159649", "159650", "159651",
-        ]
-        fallback_sina = [_code_to_sina(c) for c in fallback]
-        _universe_cache = fallback_sina
-        _universe_date = today
-        return fallback_sina
+        log.warning("Tushare ETF 列表获取失败: %s", e)
 
     if etf_list:
         _universe_cache = etf_list
         _universe_date = today
-        log.info("ETF 候选池已刷新: %s 只标的 (%s)", len(etf_list), ETF_TYPE_FILTER)
     else:
-        log.info("使用缓存的 %s 只 ETF", len(_universe_cache))
+        log.info("使用缓存的 %d 只 ETF", len(_universe_cache))
 
     return _universe_cache
 
@@ -302,49 +222,36 @@ def screen_buy_candidates(state: dict) -> list:
 
 
 def refresh_prices(symbols: list):
-    """从新浪行情 API 批量获取 ETF 实时价格。"""
+    """从 Tushare 批量获取 ETF 最新日线行情。"""
     global _price_cache
     if not symbols:
         return
-    sina_codes = ",".join(symbols)
+
+    ts_codes = [_etf_code_to_ts(s) for s in symbols]
+
     try:
-        r = requests.get(
-            f"https://hq.sinajs.cn/list={sina_codes}",
-            headers={"Referer": "https://finance.sina.com.cn"},
-            timeout=10,
-        )
-        r.encoding = "gbk"
-        for line in r.text.strip().split("\n"):
-            m = re.search(r'hq_str_(\w+)="(.+)"', line)
-            if not m:
-                continue
-            code = m.group(1)
-            fields = m.group(2).split(",")
-            if len(fields) < 32:
-                continue
-            try:
-                name = fields[0]
-                prev_close = float(fields[2])
-                current = float(fields[3])
-                high_limit = float(fields[9]) if fields[9] else prev_close * 1.1
-                low_limit = float(fields[10]) if fields[10] else prev_close * 0.9
-                _price_cache[code] = {
-                    "code": code,
-                    "name": name,
-                    "price": current,
-                    "prev_close": prev_close,
-                    "open": float(fields[1]),
-                    "high": float(fields[4]),
-                    "low": float(fields[5]),
-                    "high_limit": high_limit,
-                    "low_limit": low_limit,
-                    "volume": float(fields[8]),
-                }
-                # 补充 ETF 元信息中的名称
-                if code not in _universe_meta:
-                    _universe_meta[code] = {"name": name, "type": "", "turnover": 0}
-            except (ValueError, IndexError):
-                continue
+        codes_str = ",".join(ts_codes[:50])
+        df = pro.fund_daily(ts_code=codes_str,
+                            fields="ts_code,trade_date,open,high,low,close,pre_close,vol")
+
+        for _, row in df.iterrows():
+            ts_code = row["ts_code"]
+            code = _ts_to_etf_code(ts_code)
+            close = float(row["close"])
+            pre_close = float(row["pre_close"])
+            _price_cache[code] = {
+                "code": code,
+                "name": _ETF_NAMES.get(code, code),
+                "price": close,
+                "prev_close": pre_close,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "high_limit": round(pre_close * 1.1, 3),
+                "low_limit": round(pre_close * 0.9, 3),
+                "volume": float(row["vol"]),
+            }
+
     except Exception as e:
         log.warning("行情获取失败: %s", e)
 
@@ -355,7 +262,7 @@ def fetch_price(code: str) -> Optional[float]:
 
 
 def get_etf_name(code: str) -> str:
-    """获取 ETF 名称，优先 Sina 实时数据，其次 AKShare 元信息。"""
+    """获取 ETF 名称，优先 Tushare 数据。"""
     info = _price_cache.get(code)
     if info and info.get("name"):
         return info["name"]
@@ -611,6 +518,23 @@ def run_loop():
                     save_state(state)
                 except Exception as e:
                     log.warning("日报发送失败: %s", e)
+
+            # 日报已发送 + 非交易时段 → 退出
+            if state.get("report_sent_date") == today_str and not is_trading_time():
+                log.info("日报已发送，今日任务完成，退出进程")
+                save_state(state)
+                break
+
+            # 非交易日空闲检测：连续 3 个周期无操作 → 退出
+            if not is_trading_day() and not is_trading_time():
+                idle = state.get("_idle_cycles", 0) + 1
+                state["_idle_cycles"] = idle
+                if idle >= 3:
+                    log.info("非交易日，退出进程")
+                    save_state(state)
+                    break
+            else:
+                state["_idle_cycles"] = 0
 
             save_state(state)
 
