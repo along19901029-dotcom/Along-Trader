@@ -52,7 +52,7 @@ Tushare Pro（付费），端点使用情况：
 ## 部署路径
 
 ```
-VPS: 8.138.90.28 (Alibaba Cloud ECS, Ubuntu 22.04)
+VPS: Alibaba Cloud ECS, Ubuntu 22.04 (1C1G)
 
 /opt/ai-trader-agent/    # 美股
 /opt/ai-trader-ashare/   # A 股
