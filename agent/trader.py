@@ -1,9 +1,9 @@
 """
-AI-Trader Agent — 自动化交易脚本
-可部署到云服务器 24/7 运行，通过 ai4trade.ai API 进行模拟交易。
+AI-Trader Agent — 美股自动化交易脚本
+数据源：Tushare Pro（us_daily），本地模拟撮合，DeepSeek-v4-pro LLM 自主决策。
+T+0 无涨跌停，1 股起交易，免印花税。
 """
 
-import hashlib
 import json
 import logging
 import os
@@ -17,25 +17,33 @@ from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from typing import Optional
 
-import requests
+import pandas as pd
+import tushare as ts
+from intraday_module import refresh_intraday, get_intraday, get_intraday_price
+from curl_cffi import requests as cffi_requests
 from dotenv import load_dotenv
+
+# DeepSeek LLM 共享模块
+sys.path.insert(0, "/opt/ai-trader-common")
+from llm_client import deepseek_ask, apply_decisions
 
 # ── Config ──────────────────────────────────────────────
 load_dotenv(Path(__file__).parent / ".env")
 
-BASE_URL = os.getenv("BASE_URL", "https://ai4trade.ai")
-AGENT_NAME = os.getenv("AGENT_NAME", "AutoTrader")
-AGENT_EMAIL = os.getenv("AGENT_EMAIL", "")
-AGENT_PASSWORD = os.getenv("AGENT_PASSWORD", "")
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "demo")
+AGENT_NAME = os.getenv("AGENT_NAME", "USTrader_DeepSeek")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# Tushare Pro
+TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
+ts.set_token(TUSHARE_TOKEN)
+pro = ts.pro_api()
 
 # Email (QQ SMTP)
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.qq.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
-REPORT_EMAIL = os.getenv("REPORT_EMAIL", "504975497@qq.com")
+REPORT_EMAIL = os.getenv("REPORT_EMAIL", "your_email@qq.com")
 LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL", "60"))  # seconds
 
 LOG_DIR = Path(__file__).parent / "logs"
@@ -53,114 +61,13 @@ logging.basicConfig(
 sys.stdout.reconfigure(encoding="utf-8") if hasattr(sys.stdout, "reconfigure") else None
 log = logging.getLogger("trader")
 
-TOKEN_FILE = Path(__file__).parent / ".token"
 STATE_FILE = Path(__file__).parent / "state.json"
 
 # ── Trading Configuration ───────────────────────────────
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100000"))
 MAX_POSITION_VALUE = float(os.getenv("MAX_POSITION_VALUE", "10000"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-0.05"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.15"))
 UNIVERSE_INDEX = os.getenv("UNIVERSE_INDEX", "sp500")  # sp500 / nasdaq100
-
-# ── Session & Auth ──────────────────────────────────────
-
-
-class Session:
-    """HTTP 会话管理，自动附加 token 和处理异常。"""
-
-    def __init__(self):
-        self.token: Optional[str] = None
-        self.agent_id: Optional[int] = None
-        self.headers: dict = {}
-
-    def set_token(self, token: str):
-        self.token = token
-        self.headers = {"Authorization": f"Bearer {token}"}
-
-    def post(self, path: str, body: Optional[dict] = None) -> dict:
-        try:
-            r = requests.post(
-                f"{BASE_URL}{path}",
-                headers=self.headers,
-                json=body,
-                timeout=15,
-            )
-            r.raise_for_status()
-            return r.json()
-        except requests.RequestException as e:
-            log.warning("POST %s failed: %s", path, e)
-            return {"success": False, "error": str(e)}
-
-    def get(self, path: str, params: Optional[dict] = None) -> dict:
-        try:
-            r = requests.get(
-                f"{BASE_URL}{path}",
-                headers=self.headers,
-                params=params,
-                timeout=15,
-            )
-            r.raise_for_status()
-            return r.json()
-        except requests.RequestException as e:
-            log.warning("GET %s failed: %s", path, e)
-            return {"success": False, "error": str(e)}
-
-
-api = Session()
-
-
-def register_or_login() -> bool:
-    """注册新 Agent 或用已有凭据登录。如果本地有 token 文件则尝试恢复。"""
-    if TOKEN_FILE.exists():
-        saved = TOKEN_FILE.read_text().strip()
-        if saved:
-            api.set_token(saved)
-            me = api.get("/api/claw/agents/me")
-            if me.get("id"):
-                api.agent_id = me["id"]
-                log.info("Token 恢复成功 — Agent #%s (%s), 现金 $%s",
-                         me["id"], me.get("name"), me.get("cash"))
-                return True
-            if me.get("success") is False and "timeout" not in str(me.get("error", "")).lower():
-                log.warning("Token 已过期，重新登录")
-            else:
-                log.warning("Token 验证网络超时，继续使用已保存的 token")
-                api.agent_id = 0
-                return True
-
-    if not AGENT_EMAIL or not AGENT_PASSWORD:
-        log.error("请在 .env 中设置 AGENT_EMAIL 和 AGENT_PASSWORD")
-        return False
-
-    # 尝试登录
-    resp = api.post("/api/claw/agents/login", {
-        "email": AGENT_EMAIL,
-        "password": AGENT_PASSWORD,
-    })
-    if resp.get("token"):
-        api.set_token(resp["token"])
-        TOKEN_FILE.write_text(resp["token"])
-        api.agent_id = resp.get("agent_id")
-        log.info("登录成功 — Agent #%s", api.agent_id)
-        return True
-
-    # 登录失败则注册
-    resp = api.post("/api/claw/agents/selfRegister", {
-        "name": AGENT_NAME,
-        "email": AGENT_EMAIL,
-        "password": AGENT_PASSWORD,
-    })
-    if resp.get("token"):
-        api.set_token(resp["token"])
-        TOKEN_FILE.write_text(resp["token"])
-        api.agent_id = resp.get("agent_id")
-        log.info("注册成功 — Agent #%s (%s), 初始现金 $100,000",
-                 api.agent_id, AGENT_NAME)
-        return True
-
-    log.error("认证失败: %s", resp)
-    return False
 
 # ── State Persistence ───────────────────────────────────
 
@@ -170,8 +77,9 @@ def load_state() -> dict:
         return json.loads(STATE_FILE.read_text())
     return {
         "positions": {},
+        "cash": INITIAL_CAPITAL,
         "daily_trades": [],
-        "daily_start_equity": 0,
+        "daily_start_equity": INITIAL_CAPITAL,
         "report_sent_date": "",
         "stop_loss_hits": [],
         "take_profit_hits": [],
@@ -180,25 +88,6 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
-
-# ── Heartbeat ───────────────────────────────────────────
-
-
-def poll_heartbeat():
-    """拉取心跳，处理通知消息。"""
-    resp = api.post("/api/claw/agents/heartbeat")
-    if not resp:
-        return
-
-    messages = resp.get("messages", [])
-    for msg in messages:
-        log.info("📩 [%s] %s", msg.get("type"), msg.get("content"))
-
-    tasks = resp.get("tasks", [])
-    for task in tasks:
-        log.info("📋 Task: %s — %s", task.get("type"), task.get("input_data"))
-
-    return resp.get("recommended_poll_interval_seconds", 30)
 
 # ── Market Clock ────────────────────────────────────────
 
@@ -273,30 +162,82 @@ def minutes_after_market_close() -> int:
 # ── Market Data ─────────────────────────────────────────
 
 _price_cache: dict = {}
+_PREV_CLOSE_CACHE: dict = {}
+_price_date: str = ""  # 缓存数据的最新交易日期
 
 
 def refresh_prices(symbols: list):
-    """获取美股价格（Stooq，免费无限制，逐只查询）。"""
-    global _price_cache
-    for sym in symbols:
-        try:
-            r = requests.get(
-                "https://stooq.com/q/l/",
-                params={"s": sym.lower() + ".us", "f": "sd2t2ohlcv", "e": "json"},
-                timeout=10,
-            )
-            data = r.json()
-            for item in data.get("symbols", []):
-                name = item.get("symbol", "").replace(".US", "").upper()
-                close = item.get("close")
-                if name and close is not None and close > 0:
-                    _price_cache[name] = float(close)
-        except Exception as e:
-            log.debug("获取 %s 价格失败: %s", sym, e)
+    """从 Tushare Pro 批量获取美股最新日线行情（支持多代码逗号拼接）。"""
+    global _price_cache, _price_date
+    if not symbols:
+        return
+
+    try:
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
+        codes_str = ",".join(symbols[:50])
+        df = pro.us_daily(ts_code=codes_str, start_date=start_date, end_date=end_date,
+                          fields="ts_code,trade_date,close,pre_close,vol")
+
+        if df is not None and len(df) > 0:
+            # 从原始df取最新交易日期（不在循环中覆盖）
+            all_dates = df["trade_date"].dropna()
+            if len(all_dates) > 0:
+                _price_date = str(all_dates.max())
+            latest = df.sort_values("trade_date").groupby("ts_code").last()
+            log.info("日线收盘价日期: %s (%d只标的)", _price_date, len(latest))
+            for ts_code, row in latest.iterrows():
+                sym = ts_code.replace(".US", "").upper()
+                close = float(row["close"])
+                pre_close = float(row.get("pre_close", close))
+                if close > 0:
+                    _price_cache[sym] = close
+                    _PREV_CLOSE_CACHE[sym] = pre_close
+        # 记录持仓股收盘价
+        held = load_state().get("positions", {})
+        if held:
+            closes = []
+            for sym in held:
+                if sym in _price_cache:
+                    closes.append("{}={}".format(sym, _price_cache[sym]))
+            if closes:
+                log.info("持仓收盘价: %s", " ".join(closes))
+    except Exception as e:
+        log.warning("美股行情获取失败: %s", e)
 
 
 def fetch_price(symbol: str) -> Optional[float]:
+    """获取标的最新价格（优先腾讯实时价）。"""
+    live = get_intraday_price(symbol)
+    if live:
+        return live
     return _price_cache.get(symbol.upper())
+
+
+def fetch_prev_close(symbol: str) -> float:
+    """获取前一交易日收盘价。"""
+    return _PREV_CLOSE_CACHE.get(symbol.upper(), 0)
+
+
+def is_price_data_today() -> bool:
+    if not _price_date:
+        return False
+    today = datetime.now().strftime("%Y%m%d")
+    if _price_date == today:
+        return True
+    # 美股日线数据收盘后发布，盘中允许3日内数据（覆盖周末）
+    cutoff = (datetime.now() - timedelta(days=3)).strftime("%Y%m%d")
+    return _price_date >= cutoff
+
+
+def minutes_after_market_open() -> int:
+    """开盘后已过多少分钟。未开盘或非交易时段返回 -1。"""
+    et = _get_et_now()
+    if et.weekday() >= 5 or et.date() in _US_HOLIDAYS_2026:
+        return -1
+    mkt_open = et.replace(hour=9, minute=30, second=0, microsecond=0)
+    delta = (et - mkt_open).total_seconds()
+    return int(delta // 60) if delta >= 0 else -1
 
 
 _universe_cache: list = []
@@ -304,93 +245,109 @@ _universe_date: str = ""
 
 
 def get_universe() -> list:
-    """获取候选池（S&P 500 或 NASDAQ 100 成分股，每日刷新一次）。"""
+    """获取候选池（Tushare 指数成分股 + 静态文件兜底，不依赖外网）。"""
     global _universe_cache, _universe_date
     today = datetime.now().strftime("%Y-%m-%d")
     if _universe_cache and _universe_date == today:
         return _universe_cache
-    try:
-        if UNIVERSE_INDEX == "nasdaq100":
-            url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        else:
-            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        r = requests.get(url, timeout=15)
-        tables = __import__("pandas").read_html(r.text)
-        if UNIVERSE_INDEX == "nasdaq100":
-            tickers = tables[3]["Ticker"].dropna().tolist()
-        else:
-            tickers = tables[0]["Symbol"].dropna().tolist()
-        tickers = [t.replace(".", "-") for t in tickers if isinstance(t, str)]
-        _universe_cache = tickers
-        _universe_date = today
-        log.info("候选池已刷新: %s, %s 只标的", UNIVERSE_INDEX, len(tickers))
-        return tickers
-    except Exception as e:
-        log.warning("获取成分股失败: %s，使用缓存", e)
-        return _universe_cache if _universe_cache else []
+
+    tickers = []
+
+    # 1. 主渠道：静态 JSON 文件（国内 VPS 不依赖外网）
+    if not tickers:
+        try:
+            import json
+            static_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sp500_static.json")
+            with open(static_file, 'r') as fh:
+                tickers = json.load(fh)
+            log.info("候选池(静态文件): %s 只标的", len(tickers))
+        except Exception as e:
+            log.warning("静态成分股文件加载失败: %s", e)
+
+    # 3. 最后兜底：内存缓存
+    if not tickers and _universe_cache:
+        tickers = _universe_cache
+        log.warning("使用内存缓存: %s 只标的", len(tickers))
+
+    _universe_cache = tickers
+    _universe_date = today
+    return tickers
 
 
-def screen_buy_candidates(state: dict) -> list:
-    """从候选池筛选可买入标的，按量价排序。"""
+def get_candidates_for_llm(state: dict) -> list:
+    """给 LLM 提供原始候选标的数据（不做打分，LLM 自主判断）。"""
     positions = state.get("positions", {})
     candidates = []
-    for sym in _price_cache:
+    for sym, price in _price_cache.items():
         if sym in positions:
             continue
-        price = _price_cache[sym]
-        if price <= 0:
+        if price is None or price <= 0:
             continue
-        max_shares = int(MAX_POSITION_VALUE / max(price, 1))
-        if max_shares < 1:
+        if price > MAX_POSITION_VALUE * 2:
             continue
-        score = price  # 价格本身非排序依据，这里用占位
-        candidates.append((sym, score, price))
-    # 按价格从低到高排（低价股可买更多股，分散更好）
-    candidates.sort(key=lambda x: x[2])
-    return candidates
+        candidates.append({
+            "symbol": sym,
+            "price": round(price, 2),
+        })
+    # 取前 30 只送给 LLM（按价格排序方便 LLM 阅读）
+    candidates.sort(key=lambda x: x["price"])
+    return candidates[:30]
 
 
-def generate_uid(prefix: str = "") -> str:
-    h = hashlib.sha256(f"{prefix}{time.time()}".encode()).hexdigest()[:12]
-    return f"{prefix}{h}"
+# ── LLM System Prompt ────────────────────────────────────
 
-# ── Strategy ────────────────────────────────────────────
+LLM_SYSTEM_PROMPT = """你是美股AI交易员，管理一个自动化交易账户。你的交易市场是美国股票（S&P 500成分股）。
 
+## 交易规则
+- T+0（当天买入当天可卖出），无涨跌停限制
+- 交易时段：美东 9:30-16:00（北京时间 21:30-次日 04:00）
+- 单只股票最大持仓金额 $MAX_POS_VALUE，最大持仓数量 MAX_POS_COUNT 只
 
-def should_buy(symbol: str, price: float, state: dict) -> bool:
-    """简单的买入策略：持仓数未达上限 + 该标的未持仓。"""
-    positions = state.get("positions", {})
-    if len(positions) >= MAX_POSITIONS:
-        return False
-    if symbol in positions:
-        return False
-    return True
+## 交易原则（重要）
+- 你是长期稳健型投资者，不是日内交易员。每次买卖产生约0佣金成本。
+- 频繁换手（一天内买卖同一只股票）会严重侵蚀收益，应尽量避免。
+- 仅在以下情况考虑交易：
+  1. 止盈：单只盈利超过8%
+  2. 止损：单只亏损超过5%（或基本面恶化）
+  3. 调仓：行业过度集中需要分散，且新旧标的有明显优劣差异
+- 1-3%的小幅波动属于正常市场噪音，不应触发交易。
+- 建仓完成后，优先持有观察，让利润奔跑。
 
+## 决策框架
+你需要根据当前持仓状态和候选标的数据，做出以下决策：
+1. 是否卖出已持有的标的（止盈、止损、或调仓）
+2. 是否买入新的候选标的
+3. 哪些标的继续持有
 
-def should_sell(symbol: str, current_price: float, state: dict):
-    """止损/止盈策略。返回 (是否卖出, 原因)。"""
-    positions = state.get("positions", {})
-    if symbol not in positions:
-        return False, ""
+## 分析维度
+- 持仓标的：看浮动盈亏、仓位占比、是否需要止盈/止损
+- 候选标的：看价格、股票知名度、行业分散度
+- 风险控制：避免过度集中，单票仓位不宜过重
+- 成本意识：每次交易考虑佣金成本，无充分理由不交易
 
-    entry = positions[symbol]
-    entry_price = entry["entry_price"]
-    pnl_pct = (current_price - entry_price) / entry_price
+## 输出格式（严格JSON）
+{
+  "reasoning": "简要分析当前持仓和市场逻辑（中文，100字以内）",
+  "sells": [{"symbol": "AAPL", "reason": "达到预期收益，获利了结"}],
+  "buys": [{"symbol": "GOOGL", "reason": "看好AI赛道前景", "quantity_percent": 80}],
+  "hold": ["MSFT", "NVDA"]
+}
 
-    if pnl_pct <= STOP_LOSS_PCT:
-        return True, "stop_loss"
-    if pnl_pct >= TAKE_PROFIT_PCT:
-        return True, "take_profit"
-    return False, ""
+注意：
+- quantity_percent 范围 10-100，表示使用单只上限金额的百分比（100=满仓买入单只上限）
+- 不要重复买入已持有的标的
+- 不要卖出未持有的标的
+- sells 和 buys 可以为空数组
+- 如果当前持仓合理，可以只输出 hold
+- 优先考虑知名蓝筹股，避免投机性标的"""
 
-# ── Trade Execution ─────────────────────────────────────
-
+# ── Trade Execution (Local Simulation) ──────────────────
 
 def record_trade(action: str, symbol: str, quantity: int, price: float, reason: str):
-    """记录当日交易。"""
+    """记录当日交易到 state。"""
     state = load_state()
     trade = {
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "time": datetime.now().strftime("%H:%M:%S"),
         "action": action,
         "symbol": symbol,
         "quantity": quantity,
@@ -401,130 +358,128 @@ def record_trade(action: str, symbol: str, quantity: int, price: float, reason: 
     save_state(state)
 
 
+def execute_buy(sym: str) -> bool:
+    state = load_state()
+    price = fetch_price(sym)
+    if not price or price <= 0:
+        return False
+    max_shares = int(MAX_POSITION_VALUE / price)
+    if max_shares < 1:
+        log.warning('资金不足以买入 %s 1股', sym)
+        return False
+    cost = max_shares * price
+    fee = max(cost * 0.001, 1.0)  # 佣金 0.1%, 最低
+    total = cost + fee
+    if state['cash'] < total:
+        max_shares = int((state['cash'] - 1) / (price * 1.001))
+        if max_shares < 1:
+            log.warning('现金不足买入 %s', sym)
+            return False
+        cost = max_shares * price
+        fee = max(cost * 0.001, 1.0)
+        total = cost + fee
+    state['cash'] -= total
+    state.setdefault('positions', {})[sym] = {
+        'quantity': max_shares,
+        'entry_price': price,
+    }
+    record_trade('buy', sym, max_shares, price, 'signal')
+    save_state(state)
+    log.info('买入 %s x%s @ $%.2f 佣金$%.2f 余额$%.2f',
+             sym, max_shares, price, fee, state['cash'])
+    return True
+
+
+def execute_sell(sym: str, reason: str = 'signal') -> bool:
+    state = load_state()
+    pos = state.get('positions', {}).get(sym)
+    if not pos:
+        log.warning('无 %s 持仓', sym)
+        return False
+    qty = pos['quantity']
+    price = fetch_price(sym) or pos['entry_price']
+    proceeds = qty * price
+    fee = max(proceeds * 0.001, 1.0)  # 佣金 0.1%, 最低
+    net = proceeds - fee
+    state['cash'] += net
+    del state['positions'][sym]
+    record_trade('sell', sym, qty, price, reason)
+    save_state(state)
+    reason_cn = {'stop_loss': '止损', 'take_profit': '止盈', 'force_sell': '清仓'}.get(reason, '信号')
+    log.info('卖出 %s x%s @ $%.2f 净收入$%.2f [%s]',
+             sym, qty, price, net, reason_cn)
+    return True
+
+
+def _build_llm_context(state: dict) -> dict:
+    """组装 LLM 输入上下文：持仓 + 候选标的 + 约束。"""
+    positions = state.get("positions", {})
+    cash = state.get("cash", 0)
+
+    pos_list = []
+    for sym, p in positions.items():
+        cur_price = fetch_price(sym) or p.get("entry_price", 0)
+        entry = p.get("entry_price", 0)
+        qty = p.get("quantity", 0)
+        pnl_pct = (cur_price - entry) / entry if entry else 0
+        pos_list.append({
+            "symbol": sym,
+            "quantity": qty,
+            "entry_price": round(entry, 2),
+            "current_price": round(cur_price, 2),
+            "pnl_pct": round(pnl_pct, 4),
+            "market_value": round(cur_price * qty, 2),
+        })
+
+    candidates = get_candidates_for_llm(state)
+
+    total_market_value = sum(p["market_value"] for p in pos_list)
+    total_equity = cash + total_market_value
+
+    return {
+        "market": "美股 S&P 500",
+        "session": "open" if is_market_open() else "closed",
+        "portfolio": {
+            "total_equity": round(total_equity, 2),
+            "cash": round(cash, 2),
+            "positions_value": round(total_market_value, 2),
+            "positions": pos_list,
+        },
+        "candidates": candidates,
+        "constraints": {
+            "max_positions": MAX_POSITIONS,
+            "max_per_position": MAX_POSITION_VALUE,
+            "market_type": "US",
+        },
+    }
+
+
 def _ensure_daily_state(state: dict):
-    """跨日重置每日状态。"""
+    """跨日重置每日状态，记录开盘资产。"""
     today_str = datetime.now().strftime("%Y-%m-%d")
     if state.get("report_sent_date") != today_str:
-        # 新的一天
-        if state.get("daily_trades"):
-            state["daily_trades"] = []
-        if state.get("stop_loss_hits"):
-            state["stop_loss_hits"] = []
-        if state.get("take_profit_hits"):
-            state["take_profit_hits"] = []
-    # 记录开盘资产
+        state["daily_trades"] = []
+        state["stop_loss_hits"] = []
+        state["take_profit_hits"] = []
+    # 记录开盘资产（现金 + 持仓市值）
     if not state.get("daily_start_equity") or state.get("_start_date") != today_str:
-        state["daily_start_equity"] = state.get("cash", 100000)
+        positions_value = sum(
+            (fetch_price(sym) or p.get("entry_price", 0)) * p.get("quantity", 0)
+            for sym, p in state.get("positions", {}).items()
+        )
+        state["daily_start_equity"] = state.get("cash", INITIAL_CAPITAL) + positions_value
         state["_start_date"] = today_str
 
 
-def execute_buy(symbol: str) -> bool:
-    """执行买入（模拟交易，平台自动获取市价）。"""
-    price = fetch_price(symbol) or 100
-    quantity = max(1, int(MAX_POSITION_VALUE / max(price, 1)))
-    resp = api.post("/api/signals/realtime", {
-        "market": "us-stock",
-        "action": "buy",
-        "symbol": symbol,
-        "price": 0,
-        "quantity": quantity,
-        "executed_at": "now",
-    })
-    if resp.get("success"):
-        log.info("✅ 买入 %s x%s", symbol, quantity)
-        record_trade("buy", symbol, quantity, price, "signal")
-        return True
-    log.warning("❌ 买入失败 %s: %s", symbol, resp)
-    return False
-
-
-def execute_sell(symbol: str, reason: str = "signal") -> bool:
-    """执行卖出。reason: signal / stop_loss / take_profit / force_sell"""
-    state = load_state()
-    pos = state.get("positions", {}).get(symbol)
-    if not pos:
-        log.warning("无 %s 持仓，跳过卖出", symbol)
-        return False
-
-    price = fetch_price(symbol) or pos.get("entry_price", 0)
-    qty = pos["quantity"]
-    resp = api.post("/api/signals/realtime", {
-        "market": "us-stock",
-        "action": "sell",
-        "symbol": symbol,
-        "price": 0,
-        "quantity": qty,
-        "executed_at": "now",
-    })
-    if resp.get("success"):
-        log.info("✅ 卖出 %s x%s", symbol, qty)
-        record_trade("sell", symbol, qty, price, reason)
-        del state["positions"][symbol]
-        save_state(state)
-        if reason == "stop_loss":
-            state.setdefault("stop_loss_hits", []).append(symbol)
-            save_state(state)
-        elif reason == "take_profit":
-            state.setdefault("take_profit_hits", []).append(symbol)
-            save_state(state)
-        return True
-    log.warning("❌ 卖出失败 %s: %s", symbol, resp)
-    return False
-
-# ── Position Sync ───────────────────────────────────────
-
-
-def sync_positions():
-    """从 API 同步最新持仓和现金余额。"""
-    resp = api.get("/api/positions")
-    if not resp or "positions" not in resp:
-        return
-
-    state = load_state()
-    api_positions = resp.get("positions", [])
-    new_positions = {}
-
-    for p in api_positions:
-        sym = p["symbol"]
-        new_positions[sym] = {
-            "quantity": p.get("quantity", 0),
-            "entry_price": p.get("entry_price", 0),
-            "current_price": p.get("current_price", 0),
-            "pnl": p.get("pnl", 0),
-        }
-
-    state["positions"] = new_positions
-    state["cash"] = resp.get("cash", state.get("cash", 100000))
-    save_state(state)
-
-    if new_positions:
-        log.info("📊 当前持仓: %s", ", ".join(
-            f"{s}(qty={d['quantity']}, PnL=${d.get('pnl') or 0:.0f})"
-            for s, d in new_positions.items()
-        ))
-    else:
-        log.info("📊 空仓")
-
-    # 检查总资产
-    position_value = sum(
-        (p.get("current_price") or p.get("entry_price") or 0) * abs(p.get("quantity", 0))
-        for p in api_positions
-    )
-    total = resp.get("cash", 0) + position_value
-    log.info("💰 现金 $%.0f | 持仓市值 $%.0f | 总资产 $%.0f",
-             resp.get("cash", 0), position_value, total)
-
-# ── Main Loop ───────────────────────────────────────────
-
-
 def run_loop():
-    """主循环：心跳 → 行情 → 策略判断 → 执行交易。"""
-    log.info("══ AI-Trader Agent 启动 ══")
-    log.info("候选池: %s", UNIVERSE_INDEX)
-    log.info("止损 %.0f%% | 止盈 %.0f%% | 单笔上限 $%s | 最大持仓 %s",
-             STOP_LOSS_PCT * 100, TAKE_PROFIT_PCT * 100,
+    """主循环：行情 → LLM 决策 → 执行交易 → 日报。"""
+    log.info("══ US Stock Agent 启动 ══")
+    log.info("初始资金: $%s | 候选池: %s", INITIAL_CAPITAL, UNIVERSE_INDEX)
+    log.info("单笔上限 $%s | 最大持仓 %s 只 | T+0",
              MAX_POSITION_VALUE, MAX_POSITIONS)
-    log.info("交易时段: 美东 9:30-16:00（仅开盘时段执行买卖）")
+    log.info("决策引擎: DeepSeek-v4-pro LLM 自主决策")
+    log.info("数据源: Tushare Pro | 本地模拟撮合")
+    log.info("交易时段: 美东 9:30-16:00")
 
     state = load_state()
     _ensure_daily_state(state)
@@ -546,11 +501,7 @@ def run_loop():
         log.info("── 周期 #%s ──", cycle)
 
         try:
-            # 1. 心跳
-            poll_heartbeat()
-
-            # 2. 同步持仓
-            sync_positions()
+            # 1. 同步本地状态
             state = load_state()
             _ensure_daily_state(state)
             save_state(state)
@@ -558,31 +509,88 @@ def run_loop():
             # 3. 批量获取行情（交易时段和非交易时段都需要，用于展示）
             holdings = list(state.get("positions", {}).keys())
             universe = get_universe()
-            batch = list(set(holdings + universe[:50]))
+            batch = list(dict.fromkeys(holdings + universe[:50]))  # 持仓优先
             refresh_prices(batch)
+            refresh_intraday(batch)
 
             if is_market_open():
-                # 4. 检查现有持仓是否需要卖出（止损/止盈）
-                for symbol in list(state.get("positions", {}).keys()):
-                    price = fetch_price(symbol)
-                    if price:
-                        do_sell, reason = should_sell(symbol, price, state)
-                        if do_sell:
-                            if reason == "stop_loss":
-                                log.info("🛑 %s 触发止损", symbol)
-                            elif reason == "take_profit":
-                                log.info("🎯 %s 触达止盈", symbol)
-                            execute_sell(symbol, reason)
+                # 检查是否应该执行交易决策
+                min_after_open = minutes_after_market_open()
+                data_fresh = is_price_data_today()
 
-                # 5. 扫描候选池，寻找买入机会
-                candidates = screen_buy_candidates(state)
-                for symbol, score, price in candidates:
-                    if len(state.get("positions", {})) >= MAX_POSITIONS:
-                        break
-                    if should_buy(symbol, price, state):
-                        execute_buy(symbol)
+                # 开盘冷却期：前 5 分钟不交易（等待行情更新 + 市场情绪稳定）
+                if min_after_open < 5:
+                    log.info("⏳ 开盘冷却期（%d/5 分钟），等待行情稳定...", min_after_open)
+
+                elif not data_fresh:
+                    log.info("⏳ 行情数据日期=%s，非今日数据，等待 Tushare 更新...", _price_date)
+
+                else:
+                    # LLM 自主决策（数据新鲜 + 冷却已过）
+                    user_msg = _build_llm_context(state)
+                    # 每周期记录持仓浮动盈亏（买入价 vs 当前价）
+                    user_msg["trading_context"] = {
+                        "minutes_after_open": min_after_open,
+                        "data_date": _price_date,
+                        "note": "数据为当日实时行情，可以放心交易"
+                    }
+                    decisions = deepseek_ask(LLM_SYSTEM_PROMPT, user_msg)
+
+                    if decisions:
+                        log.info("LLM 决策: %s", decisions.get("reasoning", "")[:200])
+                        # 执行卖出
+                        for item in decisions.get("sells", []):
+                            sym = str(item.get("symbol", "")).upper()
+                            reason = item.get("reason", "LLM signal")
+                            if sym in state.get("positions", {}):
+                                execute_sell(sym, reason)
+                                time.sleep(1)
+
+                        # 重新加载状态（卖出可能改变了持仓）
                         state = load_state()
-                        time.sleep(2)
+
+                        # 执行买入（带护栏）
+                        current_count = len(state.get("positions", {}))
+                        for item in decisions.get("buys", []):
+                            sym = str(item.get("symbol", "")).upper()
+                            reason = item.get("reason", "LLM signal")
+                            qty_pct = max(10, min(100, int(item.get("quantity_percent", 100))))
+
+                            # 护栏校验
+                            if sym in state.get("positions", {}):
+                                log.warning("护栏拦截: %s 已持仓", sym)
+                                continue
+                            if current_count >= MAX_POSITIONS:
+                                log.warning("护栏拦截: 已达最大持仓数 %s", MAX_POSITIONS)
+                                break
+                            price = fetch_price(sym)
+                            if not price or price <= 0:
+                                log.warning("护栏拦截: %s 无有效价格", sym)
+                                continue
+                            if price > MAX_POSITION_VALUE:
+                                log.warning("护栏拦截: %s 价格 $%.2f 超单只上限", sym, price)
+                                continue
+
+                            # 根据 quantity_percent 调整买入数量
+                            adjusted_max = MAX_POSITION_VALUE * qty_pct / 100
+                            quantity = max(1, int(adjusted_max / max(price, 1)))
+
+                            # 临时覆盖 execute_buy 的数量计算
+                            _orig_max = MAX_POSITION_VALUE
+                            globals()["MAX_POSITION_VALUE"] = adjusted_max
+                            ok = execute_buy(sym)
+                            globals()["MAX_POSITION_VALUE"] = _orig_max
+
+                            if ok:
+                                current_count += 1
+                                time.sleep(2)
+
+                        state = load_state()
+                        # 记录 LLM reasoning 到 state 供日报使用
+                        state["_llm_reasoning"] = decisions.get("reasoning", "")
+                        save_state(state)
+                    else:
+                        log.warning("LLM 调用失败，跳过本周期交易决策")
 
                 state = load_state()
             else:
@@ -644,8 +652,6 @@ def generate_report(state: dict) -> str:
     positions = state.get("positions", {})
     cash = state.get("cash", 0)
     start_equity = state.get("daily_start_equity", 100000)
-    stop_hits = state.get("stop_loss_hits", [])
-    profit_hits = state.get("take_profit_hits", [])
 
     # 持仓市值
     position_value = sum(
@@ -691,12 +697,11 @@ def generate_report(state: dict) -> str:
     else:
         pos_rows = '<tr><td colspan="6" style="text-align:center;color:#888">空仓</td></tr>'
 
-    # 止损止盈
-    sl_text = "、".join(stop_hits) if stop_hits else "无"
-    tp_text = "、".join(profit_hits) if profit_hits else "无"
+    # LLM 决策推理
+    llm_reasoning = state.get("_llm_reasoning", "")
 
-    # 投资思路复盘（基于当日交易总结）
-    summary = _generate_summary(trades, positions, daily_pnl, stop_hits, profit_hits)
+    # 投资思路复盘
+    summary = _generate_summary(trades, positions, daily_pnl, llm_reasoning)
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
@@ -738,18 +743,15 @@ def generate_report(state: dict) -> str:
 <table><thead><tr><th>标的</th><th>数量</th><th>买入价</th><th>现价</th><th>市值</th><th>浮动盈亏</th></tr></thead>
 <tbody>{pos_rows}</tbody></table>
 
-<h2>止损/止盈触发</h2>
-<table><thead><tr><th>类型</th><th>触发标的</th></tr></thead>
-<tbody><tr><td>止损</td><td>{sl_text}</td></tr><tr><td>止盈</td><td>{tp_text}</td></tr></tbody></table>
+<h2>AI 决策思路</h2>
+<div class="summary"><strong>LLM 复盘</strong><br>{summary}</div>
 
-<div class="summary"><strong>今日投资思路复盘</strong><br>{summary}</div>
-
-<div class="footer">AI-Trader Agent · AutoTraderV2 · 此邮件由自动化系统发送</div>
+<div class="footer">AI-Trader Agent · DeepSeek-v4-pro 驱动 · 此邮件由自动化系统发送</div>
 </div></body></html>"""
 
 
-def _generate_summary(trades, positions, daily_pnl, stop_hits, profit_hits) -> str:
-    """基于当日数据生成简短复盘。"""
+def _generate_summary(trades, positions, daily_pnl, llm_reasoning: str) -> str:
+    """基于 LLM 推理 + 当日数据生成复盘。"""
     parts = []
     buy_count = sum(1 for t in trades if t["action"] == "buy")
     sell_count = sum(1 for t in trades if t["action"] == "sell")
@@ -765,23 +767,21 @@ def _generate_summary(trades, positions, daily_pnl, stop_hits, profit_hits) -> s
             sold = [t["symbol"] for t in trades if t["action"] == "sell"]
             parts.append(f"平仓标的：{'、'.join(sold)}。")
 
-    if stop_hits:
-        parts.append(f"触发止损：{'、'.join(stop_hits)}，已按纪律平仓。")
-    if profit_hits:
-        parts.append(f"触发止盈：{'、'.join(profit_hits)}，获利了结。")
-
     if daily_pnl > 0:
-        parts.append(f"当日整体录得正收益 +${daily_pnl:,.0f}，策略运行符合预期。")
+        parts.append(f"当日整体录得正收益 +${daily_pnl:,.0f}。")
     elif daily_pnl < 0:
-        parts.append(f"当日录得亏损 ${daily_pnl:,.0f}，需关注止损执行情况和市场波动。")
+        parts.append(f"当日录得亏损 ${daily_pnl:,.0f}。")
     else:
         parts.append("当日整体持平。")
 
-    # 持仓建议
+    # LLM 推理
+    if llm_reasoning:
+        parts.append(f"AI 决策逻辑：{llm_reasoning}")
+
     if positions:
-        parts.append(f"当前持有 {len(positions)} 个标的，继续按止损 -{abs(STOP_LOSS_PCT)*100:.0f}% / 止盈 +{TAKE_PROFIT_PCT*100:.0f}% 策略跟踪。")
+        parts.append(f"当前持有 {len(positions)} 个标的，由 DeepSeek-v4-pro 持续监控和决策。")
     else:
-        parts.append("当前空仓，等待下一个交易机会。")
+        parts.append("当前空仓，等待 DeepSeek LLM 判断下一个交易机会。")
 
     return "".join(parts)
 
@@ -806,14 +806,10 @@ def send_report_email(html_content: str):
 # ── Entry Point ─────────────────────────────────────────
 
 def main():
-    log.info("正在连接 ai4trade.ai ...")
-    if not register_or_login():
-        sys.exit(1)
-
-    me = api.get("/api/claw/agents/me")
-    log.info("Agent: %s | 现金: $%s | 积分: %s",
-             me.get("name"), me.get("cash"), me.get("points"))
-
+    log.info("正在启动美股 Agent ...")
+    log.info("Agent: %s | 初始资金: $%s", AGENT_NAME, INITIAL_CAPITAL)
+    log.info("数据源: Tushare Pro | 交易撮合: 本地模拟")
+    log.info("AI 引擎: DeepSeek-v4-pro")
     run_loop()
 
 

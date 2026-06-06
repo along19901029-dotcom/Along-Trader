@@ -153,3 +153,7 @@ agent/check.py
 
 # Local test output
 *_out.txt
+backtest_cache/
+data/financials.json
+*.png
+agent-combine/reports/

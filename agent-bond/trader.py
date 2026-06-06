@@ -21,6 +21,10 @@ from typing import Optional
 import tushare as ts
 from dotenv import load_dotenv
 
+# DeepSeek LLM 共享模块
+sys.path.insert(0, "/opt/ai-trader-common")
+from llm_client import deepseek_ask
+
 # ── Config ──────────────────────────────────────────────
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -34,36 +38,20 @@ ts.set_token(TUSHARE_TOKEN)
 pro = ts.pro_api()
 _BOND_NAMES: dict = {}
 
-# 资金分配
-LONG_TERM_RATIO = float(os.getenv("LONG_TERM_RATIO", "0.60"))
-ACTIVE_RATIO = float(os.getenv("ACTIVE_RATIO", "0.40"))
-
-# 中长期策略
-MAX_LONG_TERM_PER_BOND = float(os.getenv("MAX_LONG_TERM_PER_BOND", "40000"))
-MAX_LONG_TERM_POSITIONS = int(os.getenv("MAX_LONG_TERM_POSITIONS", "4"))
-LONG_TERM_TAKE_PROFIT_PCT = float(os.getenv("LONG_TERM_TAKE_PROFIT_PCT", "0.20"))
-LONG_TERM_CALL_PRICE = float(os.getenv("LONG_TERM_CALL_PRICE", "130.0"))
-MIN_YTM = float(os.getenv("MIN_YTM", "0.01"))
-MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "118.0"))
-MIN_REMAINING_YEARS = float(os.getenv("MIN_REMAINING_YEARS", "1.0"))
-MIN_BOND_RATING = os.getenv("MIN_BOND_RATING", "AA-")
-
-# 灵活交易策略
-MAX_ACTIVE_PER_BOND = float(os.getenv("MAX_ACTIVE_PER_BOND", "25000"))
-MAX_ACTIVE_POSITIONS = int(os.getenv("MAX_ACTIVE_POSITIONS", "3"))
-ACTIVE_STOP_LOSS_PCT = float(os.getenv("ACTIVE_STOP_LOSS_PCT", "-0.03"))
-ACTIVE_TAKE_PROFIT_PCT = float(os.getenv("ACTIVE_TAKE_PROFIT_PCT", "0.08"))
-MIN_ACTIVE_TURNOVER = float(os.getenv("MIN_ACTIVE_TURNOVER", "10000000"))
-
-# 通用
-MIN_DAILY_TURNOVER = float(os.getenv("MIN_DAILY_TURNOVER", "5000000"))
+# 预算约束（护栏用，非策略规则）
+LONG_TERM_BUDGET = 120000     # 中长期策略资金上限
+ACTIVE_BUDGET = 80000         # 灵活交易资金上限
+MAX_LONG_TERM_PER_BOND = 40000
+MAX_LONG_TERM_POSITIONS = 4
+MAX_ACTIVE_PER_BOND = 25000
+MAX_ACTIVE_POSITIONS = 3
 
 # Email
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.qq.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
-REPORT_EMAIL = os.getenv("REPORT_EMAIL", "504975497@qq.com")
+REPORT_EMAIL = os.getenv("REPORT_EMAIL", "your_email@qq.com")
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -206,6 +194,7 @@ def buy_reverse_repo(state: dict, amount: float) -> bool:
 # ── Market Data ─────────────────────────────────────────
 
 _price_cache: dict = {}     # raw_code → {price, prev_close, open, volume, ...}
+_price_date: str = ""
 _bond_analytics: dict = {}  # raw_code → {ytm, pure_bond_value, conv_premium, rating, remain_years, ...}
 _universe_cache: list = []
 _universe_date: str = ""
@@ -230,10 +219,6 @@ def _bond_code_to_ts(code: str) -> str:
 def _ts_to_bond_code(ts_code: str) -> str:
     return ts_code.split(".")[0]
 
-
-def _rating_score(rating: str) -> int:
-    if not rating:
-        return 0
     r = rating.strip().upper()
     for i, level in enumerate(["AAA", "AA+", "AA", "AA-", "A+", "A", "A-"]):
         if level in r:
@@ -356,7 +341,7 @@ def get_universe() -> list:
 
 
 def refresh_prices(symbols: list):
-    global _price_cache
+    global _price_cache, _price_date
     if not symbols:
         return
     ts_codes = [_bond_code_to_ts(s) for s in symbols]
@@ -370,6 +355,9 @@ def refresh_prices(symbols: list):
             if len(df) == 0:
                 continue
             row = df.iloc[-1]  # 取最新一行
+            trade_date = str(row.get("trade_date", ""))
+            if trade_date and (not _price_date or trade_date > _price_date):
+                _price_date = trade_date
             close = float(row["close"])
             pre_close = float(row["pre_close"])
             vol = float(row["vol"])
@@ -421,171 +409,126 @@ def get_analytics(code: str) -> dict:
     return _bond_analytics.get(code, {})
 
 
-# ── Strategy: Long-Term (60%) ───────────────────────────
+# ── LLM System Prompt ────────────────────────────────────
 
-def screen_long_term_candidates(state: dict) -> list:
-    """筛选中长期候选可转债：价格近面值、正YTM、高评级、久期适中。"""
+LLM_SYSTEM_PROMPT = """你是可转债AI交易员，管理一个双策略可转债交易账户。
+
+## 双策略并行
+1. **中长期持有策略（~60%资金）**：优选高评级（AA-及以上）、正YTM、价格接近面值（100-118元）的可转债。买入后长期持有至强赎或到期，关注信用资质、纯债价值和收益率。最多4只，单只上限￥40,000。
+2. **灵活交易策略（~40%资金）**：高流动性可转债波段操作，T+0随时买卖。关注成交额（>1000万）、价格动量、市场情绪。最多3只，单只上限￥25,000。
+
+## 交易规则
+- T+0（当天可买可卖），无涨跌停限制
+- 佣金万二，免印花税，最小交易单位 10 张（1手）
+- 交易时段：上午 9:30-11:30，下午 13:00-15:00
+- 价格接近 130 元可能触发强赎，面值低于 100 可能存在信用风险
+- 剩余年限 < 0.25 年（3个月）的转债应清仓
+
+## 分析维度
+- **中长期标的**：YTM（到期收益率）、评级（AAA/AA+/AA/AA-/A+）、纯债价值、剩余年限
+- **灵活标的**：成交额（turnover）、涨跌幅、日内动量
+- **风险控制**：评级下调→清仓；临近到期→清仓；强赎触发→清仓
+
+## 输出格式（严格JSON）
+{
+  "reasoning": "简要分析逻辑（中文，150字以内）",
+  "sells": [{"symbol": "113013", "reason": "评级下调至A+，信用风险上升", "strategy": "long_term"}],
+  "buys": [{"symbol": "110059", "reason": "YTM 3.2% 评级AAA 纯债保护充足", "strategy": "long_term", "quantity_percent": 80}],
+  "hold": ["128108"]
+}
+
+注意：
+- 每个 buy/sell 必须标注 "strategy": "long_term" 或 "active"
+- quantity_percent 范围 10-100，表示使用该类策略单只上限金额的百分比
+- 中长期策略不应频繁交易，灵活策略可以日内买卖
+- sells 和 buys 可以为空数组"""
+
+
+def get_candidates_for_llm(state: dict) -> list:
+    """给 LLM 提供可转债候选数据（含 YTM/评级等分析字段）。"""
     positions = state.get("positions", {})
-    lt_count = sum(1 for p in positions.values() if p.get("strategy") == "long_term")
-    if lt_count >= MAX_LONG_TERM_POSITIONS:
-        return []
-
     candidates = []
-    for code in _price_cache:
+    for code, info in _price_cache.items():
         if code in positions:
             continue
-        info = _price_cache[code]
-        price = info["price"]
-        if price <= 0:
+        price = info.get("price", 0)
+        if price is None or price <= 0:
             continue
-        # 价格区间：面值附近（100-118）
-        if price < 100 or price > MAX_ENTRY_PRICE:
-            continue
-        # 一手成本
-        lot_cost = price * 10
-        if lot_cost > state["cash"]:
-            continue
-        if lot_cost > MAX_LONG_TERM_PER_BOND:
-            continue
-
         ana = get_analytics(code)
-        ytm = ana.get("ytm", 0)
-        rating = ana.get("rating", "")
-        remain = ana.get("remain_years", 0)
-        pure_val = ana.get("pure_bond_value", 0)
-        turnover = ana.get("turnover", info.get("volume", 0) * price * 100)
-
-        # 过滤（仅当数据已知时应用）
-        if ytm != 0 and ytm < MIN_YTM:
-            continue
-        if remain > 0 and remain < MIN_REMAINING_YEARS:
-            continue
-        if rating and _rating_score(rating) < _rating_score(MIN_BOND_RATING):
-            continue
-        if turnover > 0 and turnover < MIN_DAILY_TURNOVER:
-            continue
-
-        # 得分：YTM 权重 0.5 + 评级权重 0.3 + 纯债保护权重 0.2
-        rating_norm = _rating_score(rating) / 7.0
-        pure_protection = (pure_val / price) if pure_val > 0 else 0
-        score = ytm * 5 * 0.5 + rating_norm * 0.3 + pure_protection * 0.2
-        candidates.append((code, score, price))
-
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    return candidates
+        chg_pct = (price - info["prev_close"]) / info["prev_close"] if info.get("prev_close") else 0
+        candidates.append({
+            "symbol": code,
+            "name": get_bond_name(code),
+            "price": round(price, 2),
+            "prev_close": info.get("prev_close", 0),
+            "change_pct": round(chg_pct * 100, 2),
+            "volume": info.get("volume", 0),
+            "ytm": round(ana.get("ytm", 0) * 100, 2),  # 百分比
+            "rating": ana.get("rating", ""),
+            "remain_years": round(ana.get("remain_years", 0), 2),
+            "pure_bond_value": round(ana.get("pure_bond_value", 0), 2),
+            "conv_premium": round(ana.get("conv_premium", 0) * 100, 2),
+            "turnover": round(ana.get("turnover", 0), 0),
+        })
+    candidates.sort(key=lambda x: x["change_pct"], reverse=True)
+    return candidates[:30]
 
 
-def should_add_long_term(code: str, state: dict) -> bool:
-    """判断是否可在中长期仓位上追加买入。"""
+def _build_llm_context(state: dict) -> dict:
+    """组装 LLM 输入上下文。"""
     positions = state.get("positions", {})
-    if code in positions:
-        pos = positions[code]
-        if pos.get("strategy") != "long_term":
-            return False
-        # 已有仓位，检查是否可追加
-        current_cost = pos["quantity"] * fetch_price(code)
-        if current_cost + MAX_LONG_TERM_PER_BOND * 0.5 > MAX_LONG_TERM_PER_BOND * 1.5:
-            return False
-        price = fetch_price(code)
-        if price and price > MAX_ENTRY_PRICE:
-            return False
-        return True
-    # 新开仓
-    lt_count = sum(1 for p in positions.values() if p.get("strategy") == "long_term")
-    return lt_count < MAX_LONG_TERM_POSITIONS
+    cash = state.get("cash", 0)
 
-
-def should_sell_long_term(code: str, state: dict):
-    """中长期卖出信号：触发强赎价 / 收益达标 / 评级下调 / 临近到期。"""
-    positions = state.get("positions", {})
-    if code not in positions:
-        return False, ""
-    pos = positions[code]
-    if pos.get("strategy") != "long_term":
-        return False, ""
-
-    price = fetch_price(code)
-    if not price:
-        return False, ""
-    entry = pos["entry_price"]
-
-    # 价格触及 130（多数可转债强赎触发价）
-    if price >= LONG_TERM_CALL_PRICE:
-        return True, "take_profit"
-    # 涨幅超 20%
-    if (price - entry) / entry >= LONG_TERM_TAKE_PROFIT_PCT:
-        return True, "take_profit"
-    # 评级下调至 AA- 以下
-    ana = get_analytics(code)
-    if ana.get("rating") and _rating_score(ana["rating"]) < _rating_score(MIN_BOND_RATING):
-        return True, "rating_downgrade"
-    # 剩余年限不足 3 个月
-    if ana.get("remain_years") and ana["remain_years"] < 0.25:
-        return True, "near_maturity"
-
-    return False, ""
-
-
-# ── Strategy: Active (40%) ──────────────────────────────
-
-def screen_active_candidates(state: dict) -> list:
-    """筛选灵活交易候选可转债：高流动性、动量排名。"""
-    positions = state.get("positions", {})
-    ac_count = sum(1 for p in positions.values() if p.get("strategy") == "active")
-    if ac_count >= MAX_ACTIVE_POSITIONS:
-        return []
-
-    candidates = []
-    for code in _price_cache:
-        if code in positions:
-            continue
-        info = _price_cache[code]
-        price = info["price"]
-        prev = info["prev_close"]
-        if price <= 0 or prev <= 0:
-            continue
-
+    pos_list = []
+    for code, p in positions.items():
+        cur_price = fetch_price(code) or p.get("entry_price", 0)
+        entry = p.get("entry_price", 0)
+        qty = p.get("quantity", 0)
+        pnl_pct = (cur_price - entry) / entry if entry else 0
         ana = get_analytics(code)
-        turnover = ana.get("turnover", info.get("volume", 0) * price * 100)
-        if turnover > 0 and turnover < MIN_ACTIVE_TURNOVER:
-            continue
+        pos_list.append({
+            "symbol": code,
+            "name": get_bond_name(code),
+            "strategy": p.get("strategy", "active"),
+            "quantity": qty,
+            "entry_price": round(entry, 2),
+            "current_price": round(cur_price, 2),
+            "pnl_pct": round(pnl_pct, 4),
+            "market_value": round(cur_price * qty, 2),
+            "ytm": round(ana.get("ytm", 0) * 100, 2),
+            "rating": ana.get("rating", ""),
+            "remain_years": round(ana.get("remain_years", 0), 2),
+        })
 
-        lot_cost = price * 10
-        if lot_cost > MAX_ACTIVE_PER_BOND:
-            continue
-        if lot_cost > state["cash"]:
-            continue
+    candidates = get_candidates_for_llm(state)
+    total_market_value = sum(p["market_value"] for p in pos_list)
+    lt_count = sum(1 for p in pos_list if p.get("strategy") == "long_term")
+    ac_count = len(pos_list) - lt_count
 
-        # 动量：涨跌幅 + 日内强度
-        chg_pct = (price - prev) / prev
-        intraday_pct = (price - info["open"]) / info["open"] if info["open"] > 0 else 0
-        score = chg_pct * 0.6 + intraday_pct * 0.4
-        candidates.append((code, score, price))
+    return {
+        "market": "中国可转债",
+        "session": trading_session(),
+        "portfolio": {
+            "total_equity": round(cash + total_market_value, 2),
+            "cash": round(cash, 2),
+            "positions_value": round(total_market_value, 2),
+            "positions": pos_list,
+            "long_term_count": lt_count,
+            "active_count": ac_count,
+        },
+        "candidates": candidates,
+        "constraints": {
+            "long_term_budget": LONG_TERM_BUDGET,
+            "active_budget": ACTIVE_BUDGET,
+            "max_long_term_positions": MAX_LONG_TERM_POSITIONS,
+            "max_active_positions": MAX_ACTIVE_POSITIONS,
+            "max_per_bond_long_term": MAX_LONG_TERM_PER_BOND,
+            "max_per_bond_active": MAX_ACTIVE_PER_BOND,
+            "market_type": "Bond",
+            "t0_rule": True,
+        },
+    }
 
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    return candidates
-
-
-def should_sell_active(code: str, state: dict):
-    """灵活交易卖出：止损 -3% / 止盈 +8%。"""
-    positions = state.get("positions", {})
-    if code not in positions:
-        return False, ""
-    pos = positions[code]
-    if pos.get("strategy") != "active":
-        return False, ""
-
-    price = fetch_price(code)
-    if not price:
-        return False, ""
-    entry = pos["entry_price"]
-    pnl_pct = (price - entry) / entry
-
-    if pnl_pct <= ACTIVE_STOP_LOSS_PCT:
-        return True, "stop_loss"
-    if pnl_pct >= ACTIVE_TAKE_PROFIT_PCT:
-        return True, "take_profit"
-    return False, ""
 
 
 # ── Trade Execution ─────────────────────────────────────
@@ -740,17 +683,42 @@ def _calc_total_equity(state: dict) -> float:
 
 # ── Main Loop ───────────────────────────────────────────
 
+def is_price_data_today() -> bool:
+    if not _price_date:
+        return False
+    today = datetime.now().strftime('%Y%m%d')
+    if _price_date == today:
+        return True
+    try:
+        cal = pro.trade_cal(exchange='SSE', start_date=_price_date,
+                           end_date=today, is_open='1')
+        if len(cal) == 0:
+            return False
+        last_date = str(cal.iloc[-1]['cal_date'])
+        if last_date == today and len(cal) >= 2:
+            last_date = str(cal.iloc[-2]['cal_date'])
+        return _price_date == last_date
+    except Exception:
+        cutoff = (datetime.now() - timedelta(days=3)).strftime('%Y%m%d')
+        return _price_date >= cutoff
+def minutes_after_market_open() -> int:
+    if not is_market_open():
+        return -1
+    t = datetime.now()
+    mkt_open = t.replace(hour=9, minute=30, second=0, microsecond=0)
+    delta = (t - mkt_open).total_seconds()
+    return int(delta // 60) if delta >= 0 else -1
+
+
 def run_loop():
     log.info("══ 债券 AI-Trader Agent 启动 ══")
     log.info("初始资金: ￥%s", INITIAL_CAPITAL)
-    log.info("策略: %.0f%% 中长期持有 + %.0f%% 灵活交易",
-             LONG_TERM_RATIO * 100, ACTIVE_RATIO * 100)
-    log.info("中长期: 止盈 +%.0f%%/￥%.0f | 不设止损 | 单只上限￥%s | 最大%s只",
-             LONG_TERM_TAKE_PROFIT_PCT * 100, LONG_TERM_CALL_PRICE,
+    log.info("策略: 中长期持有 + 灵活交易（双策略 LLM 自主分配）")
+    log.info("中长期: 单只上限￥%s | 最大%s只 | 关注YTM/评级/纯债价值",
              int(MAX_LONG_TERM_PER_BOND), MAX_LONG_TERM_POSITIONS)
-    log.info("灵活: 止损 %.0f%% | 止盈 +%.0f%% | 单只上限￥%s | 最大%s只 | T+0",
-             ACTIVE_STOP_LOSS_PCT * 100, ACTIVE_TAKE_PROFIT_PCT * 100,
+    log.info("灵活: 单只上限￥%s | 最大%s只 | T+0",
              int(MAX_ACTIVE_PER_BOND), MAX_ACTIVE_POSITIONS)
+    log.info("决策引擎: DeepSeek-v4-pro LLM 自主决策")
     log.info("品种: 可转债 | 佣金万二 | 免印花税 | 10张/手")
 
     state = load_state()
@@ -783,88 +751,87 @@ def run_loop():
             refresh_prices(all_symbols)
 
             if is_market_open():
-                # ── 1. 检查所有持仓的卖出信号 ──
-                for code in list(state.get("positions", {}).keys()):
-                    pos = state["positions"][code]
-                    if pos.get("strategy") == "long_term":
-                        do_sell, reason = should_sell_long_term(code, state)
-                    else:
-                        do_sell, reason = should_sell_active(code, state)
+                # 开盘冷却期 + 数据新鲜度
+                min_after_open = minutes_after_market_open()
+                data_fresh = is_price_data_today()
+                can_trade = min_after_open >= 5 and data_fresh
 
-                    if do_sell:
-                        name = get_bond_name(code)
-                        if reason == "stop_loss":
-                            log.info("🛑 %s 触发止损", name)
-                            state.setdefault("stop_loss_hits", []).append(code)
-                        elif reason == "take_profit":
-                            log.info("🎯 %s 触达止盈", name)
-                            state.setdefault("take_profit_hits", []).append(code)
-                        elif reason == "rating_downgrade":
-                            log.info("⚠ %s 评级下调，清仓", name)
-                        elif reason == "near_maturity":
-                            log.info("📅 %s 临近到期，清仓", name)
-                        execute_sell(code, reason)
+                if not can_trade:
+                    if min_after_open < 5:
+                        log.info("⏳ 开盘冷却期（%d/5 分钟），跳过交易", min_after_open)
+                    if not data_fresh:
+                        log.info("⏳ 行情数据日期=%s 非今日，等待 Tushare 更新...", _price_date)
+                else:
+                    # LLM 自主决策（一次调用同时决定中长期和灵活的买卖）
+                    user_msg = _build_llm_context(state)
+                    user_msg["trading_context"] = {
+                        "minutes_after_open": min_after_open,
+                        "data_date": _price_date,
+                    }
+                    decisions = deepseek_ask(LLM_SYSTEM_PROMPT, user_msg)
+
+                    if decisions:
+                        log.info("LLM 决策: %s", decisions.get("reasoning", "")[:200])
+
+                        # 执行卖出
+                        for item in decisions.get("sells", []):
+                            sym = str(item.get("symbol", ""))
+                            reason = item.get("reason", "LLM signal")
+                            if sym not in state.get("positions", {}):
+                                log.warning("护栏拦截: %s 未持仓", sym)
+                                continue
+                            execute_sell(sym, reason)
+                            state = load_state()
+                            time.sleep(1)
+
+                        # 执行买入（带护栏和策略校验）
                         state = load_state()
+                        positions = state.get("positions", {})
+                        lt_count = sum(1 for p in positions.values() if p.get("strategy") == "long_term")
+                        ac_count = sum(1 for p in positions.values() if p.get("strategy") == "active")
 
-                # ── 2. 中长期买入（60% 资金，分批建仓）──
-                lt_count = sum(
-                    1 for p in state.get("positions", {}).values()
-                    if p.get("strategy") == "long_term"
-                )
-                if lt_count < MAX_LONG_TERM_POSITIONS:
-                    # 扩展行情覆盖（每批 30 只，控制 API 调用频率）
-                    if len(universe) > 30:
-                        refresh_prices(universe[30:80])
-                    lt_candidates = screen_long_term_candidates(state)
-                    for code, score, price in lt_candidates:
-                        lt_count = sum(
-                            1 for p in state.get("positions", {}).values()
-                            if p.get("strategy") == "long_term"
-                        )
-                        if lt_count >= MAX_LONG_TERM_POSITIONS:
-                            break
-                        if should_add_long_term(code, state):
-                            log.info("🏦 中长期买入 %s(%s) score=%.4f YTM=%.1f%%",
-                                     get_bond_name(code), code, score,
-                                     get_analytics(code).get("ytm", 0) * 100)
-                            execute_buy(code, "long_term")
-                            state = load_state()
-                            time.sleep(1)
+                        for item in decisions.get("buys", []):
+                            sym = str(item.get("symbol", ""))
+                            reason = item.get("reason", "LLM signal")
+                            strategy = item.get("strategy", "active")
+                            qty_pct = max(10, min(100, int(item.get("quantity_percent", 100))))
 
-                # ── 3. 灵活交易买入（40% 资金，T+0 波段）──
-                ac_count = sum(
-                    1 for p in state.get("positions", {}).values()
-                    if p.get("strategy") == "active"
-                )
-                if ac_count < MAX_ACTIVE_POSITIONS:
-                    ac_candidates = screen_active_candidates(state)
-                    for code, score, price in ac_candidates:
-                        ac_count = sum(
-                            1 for p in state.get("positions", {}).values()
-                            if p.get("strategy") == "active"
-                        )
-                        if ac_count >= MAX_ACTIVE_POSITIONS:
-                            break
-                        if code not in state.get("positions", {}):
-                            log.info("📈 灵活买入 %s(%s) score=%.4f",
-                                     get_bond_name(code), code, score)
-                            execute_buy(code, "active")
-                            state = load_state()
-                            time.sleep(1)
+                            if sym in positions:
+                                log.warning("护栏拦截: %s 已持仓", sym)
+                                continue
+                            if strategy == "long_term" and lt_count >= MAX_LONG_TERM_POSITIONS:
+                                log.warning("护栏拦截: 中长期已达上限 %s", MAX_LONG_TERM_POSITIONS)
+                                continue
+                            if strategy == "active" and ac_count >= MAX_ACTIVE_POSITIONS:
+                                log.warning("护栏拦截: 灵活已达上限 %s", MAX_ACTIVE_POSITIONS)
+                                continue
+                            price = fetch_price(sym)
+                            if not price or price <= 0:
+                                log.warning("护栏拦截: %s 无有效价格", sym)
+                                continue
+
+                            ok = execute_buy(sym, strategy)
+                            if ok:
+                                if strategy == "long_term":
+                                    lt_count += 1
+                                else:
+                                    ac_count += 1
+                                time.sleep(1)
+
+                        state = load_state()
+                        state["_llm_reasoning"] = decisions.get("reasoning", "")
+                        save_state(state)
+                    else:
+                        log.warning("LLM 调用失败，跳过本周期交易")
 
                 # ── 4. 尾盘买入逆回购（14:55-15:00）──
                 now = datetime.now().time()
                 close_cutoff = now.replace(hour=14, minute=55)
                 if now >= close_cutoff and session == "afternoon":
-                    # 灵活交易闲置资金 → R-001
-                    active_positions_value = sum(
-                        fetch_price(c) * p["quantity"]
-                        for c, p in state.get("positions", {}).items()
-                        if p.get("strategy") == "active"
-                    )
-                    active_idle = state["cash"] * ACTIVE_RATIO - active_positions_value * 0.1
-                    if active_idle >= 1000:
-                        buy_reverse_repo(state, active_idle)
+                    # 闲置资金 → R-001
+                    revenue_idle = state["cash"] - 20000  # 保留2万流动
+                    if revenue_idle >= 1000:
+                        buy_reverse_repo(state, revenue_idle)
                         state = load_state()
             else:
                 pos_count = len(state.get("positions", {}))
@@ -939,8 +906,7 @@ def generate_report(state: dict) -> str:
     total_eq = _calc_total_equity(state)
     daily_pnl = total_eq - start_eq
     bond_value = total_eq - cash - repo_total
-    stop_hits = state.get("stop_loss_hits", [])
-    profit_hits = state.get("take_profit_hits", [])
+    llm_reasoning = state.get("_llm_reasoning", "")
     lt_cost = state.get("long_term_cost", 0)
     ac_cost = state.get("active_cost", 0)
 
@@ -985,10 +951,7 @@ def generate_report(state: dict) -> str:
     else:
         pos_rows = '<tr><td colspan="9" style="text-align:center;color:#888">空仓</td></tr>'
 
-    sl_text = "、".join(get_bond_name(s) for s in stop_hits) if stop_hits else "无"
-    tp_text = "、".join(get_bond_name(s) for s in profit_hits) if profit_hits else "无"
-
-    summary = _gen_summary(trades, positions, daily_pnl, stop_hits, profit_hits)
+    summary = _gen_summary(trades, positions, daily_pnl, llm_reasoning)
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
@@ -1030,23 +993,19 @@ def generate_report(state: dict) -> str:
 <table><thead><tr><th>名称</th><th>代码</th><th>数量</th><th>成本价</th><th>现价</th><th>市值</th><th>浮动盈亏</th><th>策略</th><th>YTM</th></tr></thead>
 <tbody>{pos_rows}</tbody></table>
 
-<h2>止损/止盈触发</h2>
-<table><thead><tr><th>类型</th><th>触发标的</th></tr></thead>
-<tbody><tr><td>止损 (灵活 -{abs(ACTIVE_STOP_LOSS_PCT)*100:.0f}%)</td><td>{sl_text}</td></tr>
-    <tr><td>止盈 (灵活 +{ACTIVE_TAKE_PROFIT_PCT*100:.0f}% / 中长期 +{LONG_TERM_TAKE_PROFIT_PCT*100:.0f}% 或 ￥{LONG_TERM_CALL_PRICE:.0f})</td><td>{tp_text}</td></tr></tbody></table>
+<h2>AI 决策思路</h2>
+<div class="summary"><strong>LLM 复盘</strong><br>{summary}</div>
 
-<div class="summary"><strong>今日复盘</strong><br>{summary}</div>
-
-<div class="footer">{AGENT_NAME} · 可转债双策略 · 自动化系统</div>
+<div class="footer">{AGENT_NAME} · DeepSeek-v4-pro 驱动</div>
 </div></body></html>"""
 
 
-def _gen_summary(trades, positions, daily_pnl, stop_hits, profit_hits):
+def _gen_summary(trades, positions, daily_pnl, llm_reasoning: str):
     parts = []
     buys = sum(1 for t in trades if t["action"] == "buy")
     sells = sum(1 for t in trades if t["action"] == "sell")
 
-    lt_buys = sum(1 for t in trades if t["action"] == "buy" and "long_term" in t.get("reason", ""))
+    lt_buys = sum(1 for t in trades if t["action"] == "buy" and "long_term" in str(t.get("reason", "")))
     ac_buys = buys - lt_buys
 
     if buys + sells == 0:
@@ -1059,19 +1018,17 @@ def _gen_summary(trades, positions, daily_pnl, stop_hits, profit_hits):
     if sells:
         sold = [get_bond_name(t["symbol"]) for t in trades if t["action"] == "sell"]
         parts.append("平仓: " + "、".join(sold) + "。")
-    if stop_hits:
-        parts.append(f"触发止损: {'、'.join(get_bond_name(s) for s in stop_hits)}。")
-    if profit_hits:
-        parts.append(f"触发止盈: {'、'.join(get_bond_name(s) for s in profit_hits)}。")
+    if llm_reasoning:
+        parts.append(f"AI 决策逻辑: {llm_reasoning}")
 
     lt_count = sum(1 for p in positions.values() if p.get("strategy") == "long_term")
     ac_count = len(positions) - lt_count
     if lt_count:
-        parts.append(f"中长期持有 {lt_count} 只，关注收益率稳定性和信用资质变化。")
+        parts.append(f"中长期持有 {lt_count} 只，由 DeepSeek LLM 根据YTM/评级/纯债价值监控。")
     if ac_count:
-        parts.append(f"灵活交易 {ac_count} 只，T+0 波段操作。")
+        parts.append(f"灵活交易 {ac_count} 只，T+0 波段，LLM 持续决策。")
     if not positions:
-        parts.append("当前空仓，等待合适的建仓时机。")
+        parts.append("当前空仓，等待 DeepSeek 判断合适的建仓时机。")
     return "".join(parts)
 
 
